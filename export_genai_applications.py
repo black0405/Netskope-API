@@ -77,6 +77,17 @@ REQUEST_TIMEOUT: int = 60      # seconds per HTTP request
 MAX_RETRIES: int = 5           # retries for 429 / 5xx / network errors
 BACKOFF_BASE: float = 2.0      # exponential backoff base, seconds
 
+# Print the exact request (URL + params) and a snippet of every raw response
+# to the console. Turn this on FIRST if you're getting zero records -- it
+# will show you immediately whether the problem is auth, the filter, or the
+# response shape not matching what the script expects.
+DEBUG: bool = True
+
+# Name of the pagination query parameter. Netskope's own documented example
+# for this endpoint family is "skip" (e.g. limit=100&skip=0). If your tenant
+# actually uses "offset" instead, change it here.
+OFFSET_PARAM_NAME: str = "skip"
+
 # The mandatory filter. Netskope stores this value lowercased.
 BASE_FILTER_FIELD: str = "category"
 BASE_FILTER_VALUE: str = "generativeai"
@@ -233,7 +244,14 @@ def request_page(
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             stats["calls"] += 1
+            if DEBUG:
+                print(f"  [DEBUG] GET {url}")
+                print(f"  [DEBUG] params: {params}")
+                print(f"  [DEBUG] headers: {dict(session.headers)}")
             response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if DEBUG:
+                print(f"  [DEBUG] status: {response.status_code}")
+                print(f"  [DEBUG] body  : {response.text[:800]}")
 
         except requests.exceptions.Timeout:
             wait = BACKOFF_BASE ** attempt
@@ -312,16 +330,39 @@ def request_page(
 
 
 def extract_records(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Pull the record list out of a response, whatever key it hides under."""
+    """
+    Pull the record list out of a response, whatever key it hides under.
+
+    If the payload is non-empty but none of RESULT_KEYS match, this is
+    almost always the reason "no data" happens with a healthy HTTP 200 --
+    the response shape doesn't match what we're looking for. Rather than
+    silently returning [], we scan every top-level value for the first
+    list we can find, and warn loudly either way so it's never a silent
+    failure.
+    """
     if not payload:
         return []
+
+    if isinstance(payload, list):
+        return payload
+
     for key in RESULT_KEYS:
         value = payload.get(key)
         if isinstance(value, list):
             return value
-    # Some endpoints return a bare list.
-    if isinstance(payload, list):
-        return payload
+
+    # Nothing matched the expected keys -- fall back to scanning for any
+    # list value anywhere in the payload before giving up.
+    for key, value in payload.items():
+        if isinstance(value, list):
+            print(f"  [WARN] Records found under unexpected key '{key}' "
+                  f"-- consider adding it to RESULT_KEYS.")
+            return value
+
+    print(f"  [WARN] Response had no recognizable record list. "
+          f"Top-level keys were: {list(payload.keys())}. "
+          f"If this looks like status/metadata only, the filter or auth "
+          f"is likely the issue -- check the DEBUG output above.")
     return []
 
 
@@ -370,10 +411,21 @@ def fetch_window(
                 "starttime": starttime,
                 "endtime": endtime,
                 "limit": PAGE_SIZE,
-                "offset": offset,
+                OFFSET_PARAM_NAME: offset,
             }
 
         payload = request_page(session, target, params, stats)
+
+        # Netskope wraps results with its own status block, e.g.
+        # {"result": [...], "status": {"execution": "SUCCESS", ...}}.
+        # A 200 HTTP response can still carry a query-level failure here
+        # (bad filter syntax, unknown field, etc.) -- surface it plainly.
+        status_block = payload.get("status") if isinstance(payload, dict) else None
+        if isinstance(status_block, dict) and status_block.get("execution") not in (None, "SUCCESS"):
+            print(f"  [WARN] API reported execution="
+                  f"{status_block.get('execution')!r}: "
+                  f"{status_block.get('message', '')}")
+
         page = extract_records(payload)
 
         if not page:
@@ -447,7 +499,32 @@ def resolve_day_range() -> Tuple[int, int, str]:
     return start, end, label
 
 
-def resolve_output_path(label: str) -> str:
+def prompt_for_date_range() -> Tuple[int, int, str]:
+    """
+    Ask the user which day to export. Enter is a plain date pull for the
+    calendar day 00:00:00 -> 00:00:00 next day. Leaving it blank falls back
+    to the DAY_MODE constant at the top of the script.
+    """
+    print("\nWhich day to extract?")
+    print(f"  Press Enter to use the default ({DAY_MODE}).")
+    entry = input("  Start date (YYYY-MM-DD): ").strip()
+
+    if not entry:
+        return resolve_day_range()
+
+    try:
+        parsed = time.strptime(entry, "%Y-%m-%d")
+    except ValueError:
+        print(f"  '{entry}' isn't a valid date (expected YYYY-MM-DD). "
+              f"Falling back to the default.")
+        return resolve_day_range()
+
+    start = int(time.mktime(parsed))
+    end = start + ONE_DAY - BOUNDARY_TRIM
+    return start, end, entry
+
+
+
     """Append the day being exported to the filename when configured."""
     if not DATE_STAMP_FILENAME:
         return OUTPUT_FILE
@@ -578,7 +655,7 @@ def main() -> None:
         return
 
     try:
-        start, end, label = resolve_day_range()
+        start, end, label = prompt_for_date_range()
     except ValueError as exc:
         print(f"Date error: {exc}")
         return
