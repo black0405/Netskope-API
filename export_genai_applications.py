@@ -35,11 +35,33 @@ ENDPOINT_PATH: str = "/api/v2/events/data/application"
 # If you get 401s with "bearer", flip this to "netskope".
 AUTH_MODE: str = "bearer"
 
-# Output file.
+# Output file. If DATE_STAMP_FILENAME is True the day being exported is
+# appended, e.g. GenerativeAI_Applications_2026-07-19.csv -- useful when a
+# folder of dated files is being picked up downstream.
 OUTPUT_FILE: str = "GenerativeAI_Applications.csv"
+DATE_STAMP_FILENAME: bool = True
 
-# How far back to pull, in seconds. 86400 = last 24 hours.
-LOOKBACK_SECONDS: int = 86400
+# --- Which single day to pull ---------------------------------------------
+# DAY_MODE:
+#   "yesterday" -> the full previous calendar day, 00:00:00 to 23:59:59 local
+#   "today"     -> midnight local through right now
+#   "date"      -> the specific calendar day named in TARGET_DATE
+#   "rolling"   -> the trailing 24 hours from this moment
+DAY_MODE: str = "yesterday"
+
+# Only used when DAY_MODE == "date". Format: YYYY-MM-DD
+TARGET_DATE: str = "2026-07-19"
+
+# One calendar day in seconds.
+ONE_DAY: int = 86400
+
+# Where the day ends.
+#   0 -> 00:00:00 yesterday through 00:00:00 today (a clean 86400s span)
+#   1 -> stops at 23:59:59 instead
+# Netskope treats endtime as INCLUSIVE, so with 0 an event landing exactly on
+# 00:00:00 appears in both this file and tomorrow's. Set to 1 if the
+# downstream consumer can't tolerate that duplicate.
+BOUNDARY_TRIM: int = 0
 
 # Records per page. Netskope caps this at 10000 for event data.
 PAGE_SIZE: int = 5000
@@ -373,18 +395,78 @@ def fetch_window(
     return records
 
 
+def local_midnight(epoch: float) -> int:
+    """
+    Snap an epoch timestamp back to 00:00:00 of that day in LOCAL time.
+
+    Netskope stores starttime/endtime as epoch seconds, so a "calendar day"
+    is defined by your machine's timezone. If you need UTC day boundaries
+    instead, swap time.localtime for time.gmtime and time.mktime for
+    calendar.timegm.
+    """
+    parts = list(time.localtime(epoch))
+    parts[3] = parts[4] = parts[5] = 0   # hour, minute, second
+    parts[8] = -1                        # let mktime work out DST
+    return int(time.mktime(time.struct_time(parts)))
+
+
+def resolve_day_range() -> Tuple[int, int, str]:
+    """
+    Work out the single day to export.
+
+    Returns (starttime, endtime, label) where label is a YYYY-MM-DD string
+    used for the filename and console output.
+    """
+    now = time.time()
+
+    if DAY_MODE == "today":
+        start = local_midnight(now)
+        end = int(now)
+
+    elif DAY_MODE == "yesterday":
+        start = local_midnight(now) - ONE_DAY
+        end = local_midnight(now) - BOUNDARY_TRIM
+
+    elif DAY_MODE == "date":
+        # strptime gives us the naive date; mktime turns it into local epoch.
+        parsed = time.strptime(TARGET_DATE, "%Y-%m-%d")
+        start = int(time.mktime(parsed))
+        end = start + ONE_DAY - BOUNDARY_TRIM
+
+    elif DAY_MODE == "rolling":
+        end = int(now)
+        start = end - ONE_DAY
+
+    else:
+        raise ValueError(
+            f"DAY_MODE '{DAY_MODE}' is not valid. "
+            f"Use: yesterday, today, date, rolling"
+        )
+
+    label = time.strftime("%Y-%m-%d", time.localtime(start))
+    return start, end, label
+
+
+def resolve_output_path(label: str) -> str:
+    """Append the day being exported to the filename when configured."""
+    if not DATE_STAMP_FILENAME:
+        return OUTPUT_FILE
+    if OUTPUT_FILE.lower().endswith(".csv"):
+        return f"{OUTPUT_FILE[:-4]}_{label}.csv"
+    return f"{OUTPUT_FILE}_{label}.csv"
+
+
 def fetch_all(
     session: requests.Session,
     query: str,
+    start: int,
+    now: int,
     stats: Dict[str, int],
 ) -> List[Dict[str, Any]]:
     """
-    Retrieve everything across the configured lookback, subdividing into
-    time windows to keep offset pagination correct, and deduplicating by _id.
+    Retrieve everything across the given day, subdividing into time windows
+    to keep offset pagination correct, and deduplicating by _id.
     """
-    now = int(time.time())
-    start = now - LOOKBACK_SECONDS
-
     if TIME_WINDOW_SECONDS > 0:
         bounds = list(range(start, now, TIME_WINDOW_SECONDS)) + [now]
         windows = list(zip(bounds[:-1], bounds[1:]))
@@ -495,14 +577,25 @@ def main() -> None:
         print(f"Filter error: {exc}")
         return
 
+    try:
+        start, end, label = resolve_day_range()
+    except ValueError as exc:
+        print(f"Date error: {exc}")
+        return
+
+    output_path = resolve_output_path(label)
+
     print(f"\nQuery : {query}")
     print(f"Target: {BASE_URL.rstrip('/')}{ENDPOINT_PATH}")
-    print(f"Window: last {LOOKBACK_SECONDS}s\n")
+    print(f"Day   : {label}  ({DAY_MODE})")
+    print(f"Range : {start} -> {end}  "
+          f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start))} to "
+          f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end))}]\n")
 
     session = build_session()
 
     try:
-        records = fetch_all(session, query, stats)
+        records = fetch_all(session, query, start, end, stats)
     except ApiError as exc:
         print(f"\nFAILED: {exc}")
         return
@@ -517,13 +610,14 @@ def main() -> None:
 
     flat_rows = [flatten_record(r) for r in records]
     columns = discover_columns(flat_rows)
-    export_csv(flat_rows, columns, OUTPUT_FILE)
+    export_csv(flat_rows, columns, output_path)
 
     print("\n" + "-" * 52)
+    print(f"Day exported            : {label}")
     print(f"Total records retrieved : {len(records)}")
     print(f"Unique columns found    : {len(columns)}")
     print(f"API calls made          : {stats['calls']}")
-    print(f"Exported to             : {OUTPUT_FILE}")
+    print(f"Exported to             : {output_path}")
     print("-" * 52)
 
 
