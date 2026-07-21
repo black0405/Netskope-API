@@ -212,44 +212,119 @@ def build_term(field: str, operator: str, value: str) -> str:
     return OPERATOR_MAP[key].format(f=field.strip(), v=quoted)
 
 
-def build_query(extra: Optional[Tuple[str, str, str]]) -> str:
+def build_query(extra_term: Optional[str]) -> str:
     """
     Build the full NQL query: the mandatory category filter, ANDed with the
-    user-supplied filter if one was given.
+    chosen region filter's already-built term, if one was chosen.
     """
     terms = [build_term(BASE_FILTER_FIELD, BASE_FILTER_OPERATOR, BASE_FILTER_VALUE)]
-    if extra:
-        terms.append(build_term(*extra))
+    if extra_term:
+        terms.append(extra_term)
     return " and ".join(terms)
 
 
-def prompt_for_filter() -> Optional[Tuple[str, str, str]]:
-    """
-    Ask the user for an additional filter. Returns None if they skip it.
-    Re-prompts on an unknown operator rather than failing the whole run.
-    """
-    print("\nAdd a second filter (ANDed with category = GenerativeAI).")
-    print("Press Enter at the field prompt to skip.\n")
+# ---------------------------------------------------------------------------
+# Region filter presets
+# ---------------------------------------------------------------------------
+# The second filter is no longer free text -- it's always exactly one of
+# these, ANDed with the base category filter, and nothing else. Each entry
+# is (label, field, operator, values). "values" is a list even for a
+# single-value filter; build_term joins them the same way "in" always has.
+# To add/change a region, edit this list only.
+REGION_FILTERS: List[Tuple[str, str, str, List[str]]] = [
+    ("APAC IN", "usergroup", "in", [
+        "AP1.OFC.LOC/India/Groups/IN_Global_netskope_AP1User",
+        "india.asia.gcn.local/IN/Administrative/Groups - Security/IN_Global_netskope_Alluser",
+        "ONE.OFC.LOC/Zone-ABI Global/Managed Objects/Managed Groups/SONEG-Netskope-ABI-GOA Team",
+    ]),
+    ("APAC VN", "organization_unit", "in", [
+        "AP1.OFC.LOC/Vietnam/Users",
+    ]),
+    ("APAC KR", "usergroup", "in", [
+        "ob.co.kr/OB/Groups/User/manual/S001",
+    ]),
+    ("APAC CN", "access_method", "in", [
+        "Local Proxy",
+    ]),
+    ("EUR", "usergroup", "in", [
+        "we.interbrew.net/ABI-IBS-EU-EuropeDC1 (Amsterdam)/Groups/User Groups/Applications/G-SWED-Netskope_Users",
+        "rus.efesmoscow/GFolders/Netskope/G-SRUSG-NetskopeUsers_Exeptions-RUK",
+        "rus.efesmoscow/GFolders/Netskope/G-SRUSG-NetskopeUsers-UA",
+        "we.interbrew.net/ABI-IBS-EU-EuropeDC1 (Amsterdam)/Groups/User Groups/Applications/G-SWEG-DE-Netskope_Users",
+        "we.interbrew.net/ABI-IBS-EU-EuropeDC1 (Amsterdam)/Groups/User Groups/Applications/SONED-ABI-EUR-Netskope-DigitalSolutions-Users",
+        "we.interbrew.net/ABI-IBS-EU-EuropeDC1 (Amsterdam)/Groups/User Groups/Applications/G-SWEG-EUR-NPA-VPN",
+        "rus.efesmoscow/GFolders/Netskope/G-SRUSG-NetskopeUsers-RU",
+        "we.interbrew.net/ABI-IBS-EU-EuropeDC1 (Amsterdam)/Groups/User Groups/Applications/G-SWED-Netskope_UAT",
+        "ccc.europe.gcn.local/Applications/Netscope/G-NPA-Users",
+        "ccc.europe.gcn.local/Applications/Zscaler/G Users Proxy ZScaler",
+        "ccc.europe.gcn.local/Applications/Zscaler/G Users Proxy HyperCare_Netskope",
+        "we.interbrew.net/ABI-IBS-EU-EuropeDC1 (Amsterdam)/Groups/User Groups/Applications/G-SWEG-BE-Netskope_Users",
+    ]),
+    ("AFR", "usergroup", "in", [
+        "beerdivision.africa.gcn.local/Groups/ZScaler Proxy/SG - AFR Proxy - Marketing Internet Access",
+        "beerdivision.africa.gcn.local/Groups/ZScaler Proxy/SG - AFR Proxy - Standard Internet Access",
+        "ONE.OFC.LOC/Zone-ABI Global/Managed Objects/Managed Groups/SONED-Workplace-MUstdinternetaccess",
+        "beerdivision.africa.gcn.local/Groups/ZScaler Proxy/SG - AFR Proxy - Hypercare Admin Only",
+    ]),
+    ("GHQ", "usergroup", "equals", [
+        "ONE.OFC.LOC/Zone-ABI Global/Managed Objects/Managed Groups/SONEG-NetskopePolicy-GHQ-AllUsers",
+    ]),
+    ("MAZ", "usergroup", "in", [
+        "modelo.gmodelo.com.mx/Corporativo/Grupos/Diblo/GPO Groups/MAZ_Proxy_Mancom",
+        "modelo.gmodelo.com.mx/Corporativo/Grupos/Diblo/GPO Groups/MAZ_Proxy_Advanced",
+        "modelo.gmodelo.com.mx/Groups/Security/MAZ_Proxy_Service",
+        "modelo.gmodelo.com.mx/Corporativo/Grupos/Diblo/GPO Groups/MAZ_Proxy_Marketing",
+        "modelo.gmodelo.com.mx/Corporativo/Grupos/Diblo/GPO Groups/MAZ_Proxy_Basic",
+    ]),
+    ("NAZ", "usergroup", "in", [
+        "abc.corp.anheuser-busch.com/Security Groups/Application Groups/NetSkope/APP ROLE-NAZ-Netskope_ABC",
+        "na.interbrew.net/Security Groups/Application Groups/Netskope/APP ROLE-NAZ-Netskope_NA",
+        "abpg.corp.anheuser-busch.com/Security Groups/Application Groups/Netskope/APP ROLE-NAZ-Netskope_ABPG",
+        "ONE.OFC.LOC/Zone-North America/Security Groups/Application Groups/Netskope/APP ROLE-NAZ-Netskope_ONE",
+    ]),
+    ("SAZ", "usergroup", "in", [
+        "cbn.com.bo/Users/SLASG_Netskope_AllUsers_BO",
+        "cmqpnt.bue.bemberg.com.ar/Users/SLASG_Netskope_AllUsers_AR",
+        "cervepar.local/Users/SLASG_Netskope_AllUsers_PY",
+        "quinsacl.sgo.quilmes.cl/Users/SLASG_Netskope_AllUsers_CL",
+        "quinsauy.mvd.bemberg.com.uy/Users/SLASG_Netskope_AllUsers_UY",
+        "ONE.OFC.LOC/Zone-Latin America South/Managed Objects/Managed Groups/Netskope/SONEG_Netskope_AllUsers_LAS",
+        "la.interbrew.net/Corporativo/ADM_CENTRAL_AC/Service_Groups/SAZ_LAN_Netskope_Advanced",
+        "la.interbrew.net/Corporativo/ADM_CENTRAL_AC/Service_Groups/SAZ_LAN_Netskope_Intermediate",
+    ]),
+]
 
-    field = input("  Field name (e.g. appname, user, app): ").strip()
-    if not field:
-        print("  No extra filter -- pulling all GenerativeAI events.")
-        return None
 
-    print(f"  Operators: {', '.join(sorted(OPERATOR_MAP))}")
+def prompt_for_region_filter() -> Optional[str]:
+    """
+    Menu of pre-approved regional filters. This is the ONLY second filter --
+    there is no free-text field/operator/value entry anymore. Returns the
+    fully-built NQL term for the chosen region, or None for category-only.
+    """
+    print("\nSecond filter -- pick a region (ANDed with category = GenerativeAI).")
+    for i, (label, _field, _operator, _values) in enumerate(REGION_FILTERS, 1):
+        print(f"  {i}. {label}")
+    print("  0. None (category filter only)")
+
+    by_label = {entry[0].lower(): entry for entry in REGION_FILTERS}
+
     while True:
-        operator = input("  Operator [equals]: ").strip() or "equals"
-        key = operator.lower().replace("_", "").replace(" ", "")
-        if key in OPERATOR_MAP:
-            break
-        print(f"  '{operator}' is not supported. Try again.")
+        choice = input("Choice: ").strip()
+        if choice in ("", "0"):
+            print("  No region filter -- pulling all GenerativeAI events.")
+            return None
 
-    value = input("  Value (e.g. ChatGPT): ").strip()
-    if not value:
-        print("  Empty value -- skipping the extra filter.")
-        return None
+        if choice.isdigit() and 1 <= int(choice) <= len(REGION_FILTERS):
+            label, field, operator, values = REGION_FILTERS[int(choice) - 1]
+        elif choice.lower() in by_label:
+            label, field, operator, values = by_label[choice.lower()]
+        else:
+            print(f"  '{choice}' isn't valid. Enter a number 1-{len(REGION_FILTERS)}, "
+                  f"a region name, or 0 for none.")
+            continue
 
-    return field, operator, value
+        print(f"  Using: {label}")
+        return build_term(field, operator, ", ".join(values))
 
 
 # ---------------------------------------------------------------------------
@@ -820,10 +895,10 @@ def main() -> None:
         print("Set API_TOKEN and BASE_URL at the top of the script first.")
         return
 
-    extra = prompt_for_filter()
+    extra_term = prompt_for_region_filter()
 
     try:
-        query = build_query(extra)
+        query = build_query(extra_term)
     except ValueError as exc:
         print(f"Filter error: {exc}")
         return
@@ -871,7 +946,7 @@ def main() -> None:
     if DESIRED_COLUMNS:
         missing = [c for c in DESIRED_COLUMNS if c not in discovered]
         if missing:
-            print(f"  [WARN] Requested columns not found in the data "
+            print(f"  [WARN] Requested columns not found in the data"
                   f"(will export blank): {', '.join(missing)}")
         columns = DESIRED_COLUMNS
     else:
