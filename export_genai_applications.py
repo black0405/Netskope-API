@@ -100,6 +100,30 @@ BASE_FILTER_FIELD: str = "category"
 BASE_FILTER_VALUE: str = "Generative AI"
 BASE_FILTER_OPERATOR: str = "in"
 
+# How many sample records to pull in preview mode (one API call, no time-
+# window subdivision, so it comes back in a couple of seconds regardless of
+# how big TIME_WINDOW_SECONDS/PAGE_SIZE are for the full run).
+PREVIEW_LIMIT: int = 20
+
+# Restrict and reorder the exported CSV to exactly these fields. Leave empty
+# to keep the default behaviour (every discovered field becomes a column).
+# Use the REAL field names from a preview run's "Fields found:" line --
+# guessing here just trades one mismatch for another. A column listed here
+# that never appears in the data is still exported, blank, as required.
+# Example, once you know the real names:
+#   DESIRED_COLUMNS = ["app", "category", "ccl", "client_bytes_total",
+#                      "numbytes_total", "server_bytes_total", "sessions"]
+DESIRED_COLUMNS: List[str] = []
+
+# Optional: rename the technical field names to friendlier headers in the
+# final CSV. Only applied to columns that are actually present. Example:
+#   RENAME_COLUMNS = {"app": "applications", "ccl": "cci",
+#                      "client_bytes_total": "bytes uploaded",
+#                      "server_bytes_total": "bytes downloaded",
+#                      "numbytes_total": "total bytes",
+#                      "sessions": "# sessions"}
+RENAME_COLUMNS: Dict[str, str] = {}
+
 # ---------------------------------------------------------------------------
 # FILTER SYNTAX
 # ---------------------------------------------------------------------------
@@ -169,8 +193,18 @@ def build_term(field: str, operator: str, value: str) -> str:
         raw = f"*{raw}"
 
     if key == "in":
-        # "a, b, c" -> ('a','b','c')
-        parts = [quote_value(p.strip()) for p in raw.split(",") if p.strip()]
+        # Accepts either bare "a, b, c" or a pasted-in ['a', 'b'] / ["a","b"]
+        # form -- strip any wrapping brackets and per-item quotes first so
+        # the value never gets double-wrapped into something like
+        # in ['[\'a\']'], which matches nothing.
+        cleaned = raw.strip()
+        if cleaned.startswith("[") and cleaned.endswith("]"):
+            cleaned = cleaned[1:-1]
+        parts = []
+        for item in cleaned.split(","):
+            item = item.strip().strip("'").strip('"').strip()
+            if item:
+                parts.append(quote_value(item))
         quoted = "[" + ", ".join(parts) + "]"
     else:
         quoted = quote_value(raw)
@@ -661,11 +695,118 @@ def discover_columns(rows: Iterable[Dict[str, Any]]) -> List[str]:
 def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> None:
     """
     Write to CSV with every discovered field as a column. Missing values are
-    written blank. QUOTE_MINIMAL keeps embedded commas safe.
+    written blank. QUOTE_MINIMAL keeps embedded commas safe. RENAME_COLUMNS,
+    if set, relabels headers for columns that are actually present.
     """
     frame = pd.DataFrame(rows, columns=columns)
     frame = frame.where(pd.notnull(frame), "")
+    if RENAME_COLUMNS:
+        frame = frame.rename(columns=RENAME_COLUMNS)
     frame.to_csv(path, index=False, quoting=csv.QUOTE_MINIMAL, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Zero-result diagnostics
+# ---------------------------------------------------------------------------
+
+def diagnose_zero_results(
+    session: requests.Session,
+    start: int,
+    end: int,
+    stats: Dict[str, int],
+) -> None:
+    """
+    Runs automatically when the filtered pull comes back empty. Makes one
+    lightweight UNFILTERED call over the same day to answer two questions
+    without another round of manual DEBUG digging:
+
+      1. Is there any data at all for this day/tenant/token? If not, the
+         problem is auth, date range, or tenant-side -- not the filter.
+      2. What do the real field names and category-ish values look like?
+         A wrong filter field name or a category label that doesn't match
+         what's actually stored is the most common reason for 0 rows.
+    """
+    url = BASE_URL.rstrip("/") + ENDPOINT_PATH
+    params = {"starttime": start, "endtime": end, "limit": 5, OFFSET_PARAM_NAME: 0}
+
+    print("\nFilter matched nothing -- running one unfiltered check on the "
+          "same day to see what's actually there...")
+    try:
+        payload = request_page(session, url, params, stats)
+    except ApiError as exc:
+        print(f"  Unfiltered check also failed: {exc}")
+        return
+
+    sample = extract_records(payload)
+    if not sample:
+        print("  No records at all for this day, even without a filter. "
+              "That points to auth, the date range, or tenant retention -- "
+              "not the filter text. Try DEBUG = True and a wider date range.")
+        return
+
+    flat_sample = [flatten_record(r) for r in sample]
+    cols = discover_columns(flat_sample)
+    shown = cols[:40]
+    print(f"  Data exists: found {len(sample)} unfiltered sample record(s).")
+    print(f"  Available fields: {', '.join(shown)}"
+          f"{' ...' if len(cols) > len(shown) else ''}")
+
+    # Surface anything that looks like it could be the field(s) being
+    # filtered on, along with real sample values, so a wrong field name or
+    # wrong expected value is obvious at a glance.
+    candidates = [c for c in cols
+                  if any(term in c.lower() for term in ("categ", "org", "unit", "ou"))]
+    for field in candidates:
+        values = sorted({str(row[field]) for row in flat_sample
+                          if row.get(field) not in (None, "")})
+        if values:
+            print(f"    {field} sample value(s): {', '.join(values[:5])}")
+
+
+# ---------------------------------------------------------------------------
+# Preview mode
+# ---------------------------------------------------------------------------
+
+def run_preview(
+    session: requests.Session,
+    query: str,
+    start: int,
+    end: int,
+    stats: Dict[str, int],
+) -> None:
+    """
+    One fast API call -- no time-window subdivision, small limit -- so you
+    can check the query and field names in seconds instead of waiting
+    through a full day's worth of windowed pagination. Writes a small
+    preview_ CSV too, in case the console truncates long field lists.
+    """
+    url = BASE_URL.rstrip("/") + ENDPOINT_PATH
+    params = {
+        "query": query,
+        "starttime": start,
+        "endtime": end,
+        "limit": PREVIEW_LIMIT,
+        OFFSET_PARAM_NAME: 0,
+    }
+    print(f"\nPreview: single call, limit={PREVIEW_LIMIT}, no windowing...")
+    payload = request_page(session, url, params, stats)
+    records = extract_records(payload)
+
+    if not records:
+        print("  No records for this filter/day. Run the full pull instead -- "
+              "it automatically runs an unfiltered diagnostic on zero results.")
+        return
+
+    flat_rows = [flatten_record(r) for r in records]
+    columns = discover_columns(flat_rows)
+    print(f"  Got {len(records)} sample record(s).")
+    print(f"  Fields found: {', '.join(columns)}")
+
+    preview_path = "preview_" + OUTPUT_FILE
+    export_csv(flat_rows, DESIRED_COLUMNS or columns, preview_path)
+    print(f"  Sample written to: {preview_path}")
+    print("  Once the field names/values look right, rerun and choose the "
+          "full day pull.")
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +841,15 @@ def main() -> None:
 
     session = build_session()
 
+    mode = input("\nRun mode -- [P]review (fast, "
+                 f"{PREVIEW_LIMIT} records) or [F]ull day? [F]: ").strip().lower()
+    if mode.startswith("p"):
+        try:
+            run_preview(session, query, start, end, stats)
+        except ApiError as exc:
+            print(f"\nFAILED: {exc}")
+        return
+
     print("Fetching...")
     try:
         records = fetch_all(session, query, start, end, stats)
@@ -713,16 +863,26 @@ def main() -> None:
     if not records:
         print("\nNo records matched. Nothing was written.")
         print(f"API calls made: {stats['calls']}")
+        diagnose_zero_results(session, start, end, stats)
         return
 
     flat_rows = [flatten_record(r) for r in records]
-    columns = discover_columns(flat_rows)
+    discovered = discover_columns(flat_rows)
+    if DESIRED_COLUMNS:
+        missing = [c for c in DESIRED_COLUMNS if c not in discovered]
+        if missing:
+            print(f"  [WARN] Requested columns not found in the data "
+                  f"(will export blank): {', '.join(missing)}")
+        columns = DESIRED_COLUMNS
+    else:
+        columns = discovered
     export_csv(flat_rows, columns, output_path)
 
     print("\n" + "-" * 52)
     print(f"Day exported            : {label}")
     print(f"Total records retrieved : {len(records)}")
-    print(f"Unique columns found    : {len(columns)}")
+    print(f"Unique columns found    : {len(discovered)}")
+    print(f"Columns exported        : {len(columns)}")
     print(f"API calls made          : {stats['calls']}")
     print(f"Exported to             : {output_path}")
     print("-" * 52)
