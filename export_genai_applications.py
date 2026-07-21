@@ -524,7 +524,7 @@ def prompt_for_date_range() -> Tuple[int, int, str]:
     return start, end, entry
 
 
-
+def resolve_output_path(label: str) -> str:
     """Append the day being exported to the filename when configured."""
     if not DATE_STAMP_FILENAME:
         return OUTPUT_FILE
