@@ -89,8 +89,16 @@ DEBUG: bool = True
 OFFSET_PARAM_NAME: str = "skip"
 
 # The mandatory filter. Netskope stores this value lowercased.
+# category is frequently a MULTI-VALUE field on an app record (an app can
+# sit in several categories at once), and "eq" only matches when the field
+# holds exactly that one value -- against a list it typically matches
+# nothing, which is the most common reason this filter silently returns
+# zero rows. "in" checks membership instead, so it matches whether the
+# field is a single value or a list containing it. If your tenant's schema
+# really does store category as a single scalar, "equals" is still fine.
 BASE_FILTER_FIELD: str = "category"
-BASE_FILTER_VALUE: str = "generativeai"
+BASE_FILTER_VALUE: str = "Generative AI"
+BASE_FILTER_OPERATOR: str = "in"
 
 # ---------------------------------------------------------------------------
 # FILTER SYNTAX
@@ -163,7 +171,7 @@ def build_term(field: str, operator: str, value: str) -> str:
     if key == "in":
         # "a, b, c" -> ('a','b','c')
         parts = [quote_value(p.strip()) for p in raw.split(",") if p.strip()]
-        quoted = "(" + ", ".join(parts) + ")"
+        quoted = "[" + ", ".join(parts) + "]"
     else:
         quoted = quote_value(raw)
 
@@ -175,7 +183,7 @@ def build_query(extra: Optional[Tuple[str, str, str]]) -> str:
     Build the full NQL query: the mandatory category filter, ANDed with the
     user-supplied filter if one was given.
     """
-    terms = [build_term(BASE_FILTER_FIELD, "equals", BASE_FILTER_VALUE)]
+    terms = [build_term(BASE_FILTER_FIELD, BASE_FILTER_OPERATOR, BASE_FILTER_VALUE)]
     if extra:
         terms.append(build_term(*extra))
     return " and ".join(terms)
