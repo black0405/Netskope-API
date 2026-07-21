@@ -81,7 +81,7 @@ BACKOFF_BASE: float = 2.0      # exponential backoff base, seconds
 # to the console. Turn this on FIRST if you're getting zero records -- it
 # will show you immediately whether the problem is auth, the filter, or the
 # response shape not matching what the script expects.
-DEBUG: bool = True
+DEBUG: bool = False
 
 # Name of the pagination query parameter. Netskope's own documented example
 # for this endpoint family is "skip" (e.g. limit=100&skip=0). If your tenant
@@ -389,6 +389,25 @@ def extract_cursor(payload: Dict[str, Any]) -> Optional[str]:
 # Pagination
 # ---------------------------------------------------------------------------
 
+def render_progress(stats: Dict[str, int], bar_width: int = 28) -> None:
+    """
+    Draw a single-line, in-place progress bar (overwrites itself with \r
+    rather than scrolling the console with one line per page/window).
+    """
+    total = stats.get("total_windows", 1) or 1
+    done = stats.get("windows_done", 0)
+    frac = min(done / total, 1.0)
+    filled = int(bar_width * frac)
+    bar = "#" * filled + "-" * (bar_width - filled)
+    print(
+        f"\r  [{bar}] {int(frac * 100):3d}%  "
+        f"{stats.get('records', 0):>7} records  "
+        f"{stats.get('calls', 0):>4} calls",
+        end="",
+        flush=True,
+    )
+
+
 def fetch_window(
     session: requests.Session,
     query: str,
@@ -440,7 +459,8 @@ def fetch_window(
             break
 
         records.extend(page)
-        print(f"    page +{len(page):>5}  (window total {len(records)})")
+        stats["records"] = stats.get("records", 0) + len(page)
+        render_progress(stats)
 
         cursor = extract_cursor(payload)
         if cursor:
@@ -558,12 +578,14 @@ def fetch_all(
     else:
         windows = [(start, now)]
 
+    stats["total_windows"] = len(windows)
+    stats["windows_done"] = 0
+    stats.setdefault("records", 0)
+
     seen: set = set()
     all_records: List[Dict[str, Any]] = []
 
     for index, (w_start, w_end) in enumerate(windows, 1):
-        print(f"  window {index}/{len(windows)}  "
-              f"[{w_start} -> {w_end}]")
         for record in fetch_window(session, query, w_start, w_end, stats):
             # _id is Netskope's per-event unique key. Fall back to the whole
             # record if it's absent so we never drop legitimate rows.
@@ -572,7 +594,10 @@ def fetch_all(
                 continue
             seen.add(key)
             all_records.append(record)
+        stats["windows_done"] = index
+        render_progress(stats)
 
+    print()  # move off the progress bar line once the pull is complete
     return all_records
 
 
@@ -670,15 +695,12 @@ def main() -> None:
 
     output_path = resolve_output_path(label)
 
-    print(f"\nQuery : {query}")
-    print(f"Target: {BASE_URL.rstrip('/')}{ENDPOINT_PATH}")
-    print(f"Day   : {label}  ({DAY_MODE})")
-    print(f"Range : {start} -> {end}  "
-          f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start))} to "
-          f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end))}]\n")
+    print(f"\n{label} ({DAY_MODE})  |  {query}")
+    print(f"{BASE_URL.rstrip('/')}{ENDPOINT_PATH}")
 
     session = build_session()
 
+    print("Fetching...")
     try:
         records = fetch_all(session, query, start, end, stats)
     except ApiError as exc:
