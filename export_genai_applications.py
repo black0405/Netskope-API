@@ -107,22 +107,42 @@ PREVIEW_LIMIT: int = 20
 
 # Restrict and reorder the exported CSV to exactly these fields. Leave empty
 # to keep the default behaviour (every discovered field becomes a column).
-# Use the REAL field names from a preview run's "Fields found:" line --
-# guessing here just trades one mismatch for another. A column listed here
-# that never appears in the data is still exported, blank, as required.
-# Example, once you know the real names:
-#   DESIRED_COLUMNS = ["app", "category", "ccl", "client_bytes_total",
-#                      "numbytes_total", "server_bytes_total", "sessions"]
-DESIRED_COLUMNS: List[str] = []
+# A column listed here that never appears in the data is still exported,
+# blank, as required.
+#
+# Mapped from the requested business columns to the REAL Netskope field
+# names in this event schema. Three had no clean match -- see the comments;
+# swap them if a preview run shows a better field for your tenant:
+#   Object Type       -> "type"   (no object_type field in this schema)
+#   Object Name       -> (none)   left as a placeholder, exports blank
+#   Sum-File Size(MB) -> "count"  (this event type carries NO bytes/size
+#                                  field, so a true MB sum isn't available
+#                                  here; "count" is the only numeric column)
+DESIRED_COLUMNS: List[str] = [
+    "user",                # User
+    "app",                 # Application
+    "url",                 # URL
+    "activity",            # Activity
+    "type",               # Object Type   (closest available)
+    "object_name",        # Object Name    (not in schema -> exports blank)
+    "timestamp",          # Event Date     (epoch; see RENAME note)
+    "organization_unit",   # Organization Unit
+    "count",              # Sum - File Size (MB)  (no size field -> count)
+]
 
-# Optional: rename the technical field names to friendlier headers in the
-# final CSV. Only applied to columns that are actually present. Example:
-#   RENAME_COLUMNS = {"app": "applications", "ccl": "cci",
-#                      "client_bytes_total": "bytes uploaded",
-#                      "server_bytes_total": "bytes downloaded",
-#                      "numbytes_total": "total bytes",
-#                      "sessions": "# sessions"}
-RENAME_COLUMNS: Dict[str, str] = {}
+# Rename the technical field names to the friendly headers you asked for.
+# Only applied to columns actually present in DESIRED_COLUMNS above.
+RENAME_COLUMNS: Dict[str, str] = {
+    "user": "User",
+    "app": "Application",
+    "url": "URL",
+    "activity": "Activity",
+    "type": "Object Type",
+    "object_name": "Object Name",
+    "timestamp": "Event Date",
+    "organization_unit": "Organization Unit",
+    "count": "Sum - File Size (MB)",
+}
 
 # ---------------------------------------------------------------------------
 # FILTER SYNTAX
@@ -895,7 +915,10 @@ def main() -> None:
         print("Set API_TOKEN and BASE_URL at the top of the script first.")
         return
 
-    extra_term = prompt_for_region_filter()
+    # Second filter (region presets) disabled for now -- category-only pull.
+    # Re-enable by uncommenting the line below.
+    # extra_term = prompt_for_region_filter()
+    extra_term = None
 
     try:
         query = build_query(extra_term)
@@ -946,7 +969,7 @@ def main() -> None:
     if DESIRED_COLUMNS:
         missing = [c for c in DESIRED_COLUMNS if c not in discovered]
         if missing:
-            print(f"  [WARN] Requested columns not found in the data"
+            print(f"  [WARN] Requested columns not found in the data "
                   f"(will export blank): {', '.join(missing)}")
         columns = DESIRED_COLUMNS
     else:
