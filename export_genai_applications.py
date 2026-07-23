@@ -198,6 +198,11 @@ MB_DECIMALS: int = 2
 ADD_ROW_NUMBER: bool = True
 ROW_NUMBER_START: int = 1
 
+# Header text for that column. "" leaves the heading blank. If your
+# spreadsheet tool mishandles a blank first heading, set this to something
+# like "S.No" or "#".
+ROW_NUMBER_HEADER: str = ""
+
 # Rename the technical field names to the friendly headers you asked for.
 # Only applied to columns actually present in DESIRED_COLUMNS above.
 RENAME_COLUMNS: Dict[str, str] = {
@@ -1002,14 +1007,17 @@ def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> Non
     if RENAME_COLUMNS:
         frame = frame.rename(columns=RENAME_COLUMNS)
 
-    # Unnamed leftmost counter column. Inserted last so it isn't affected by
-    # the rename map, and given an empty header name so the CSV's first
-    # column heading is blank.
+    # Unnamed leftmost counter column. Built as an explicit list (not a
+    # range) and re-assembled by column order rather than using insert(),
+    # so it behaves identically across pandas versions.
     if ADD_ROW_NUMBER:
-        frame.insert(
-            0, "",
-            range(ROW_NUMBER_START, ROW_NUMBER_START + len(frame)),
-        )
+        numbers = [ROW_NUMBER_START + i for i in range(len(frame))]
+        frame = frame.copy()
+        frame[ROW_NUMBER_HEADER] = numbers
+        ordered = [ROW_NUMBER_HEADER] + [
+            c for c in frame.columns if c != ROW_NUMBER_HEADER
+        ]
+        frame = frame[ordered]
 
     frame.to_csv(path, index=False, quoting=csv.QUOTE_MINIMAL, encoding="utf-8")
 
