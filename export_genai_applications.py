@@ -134,6 +134,9 @@ DESIRED_COLUMNS: List[str] = [
     "object",              # Object Name  (the named file/folder/message)
     "timestamp",          # Event Date     (epoch; see RENAME note)
     "organization_unit",   # Organization Unit
+    "file_size",           # Sum - File Size (MB)  (raw field is BYTES;
+                           #   summed across the user+app pair, then
+                           #   converted to MB on export)
     # Uncomment to also see whether each row was allowed/blocked and whether
     # it raised an alert -- useful for confirming a block-only dataset:
     # "action",
@@ -164,15 +167,28 @@ SEND_FIELDS_PARAM: bool = True
 DEDUPE_ON: List[str] = ["user", "app"]
 
 # Epoch fields (like `timestamp`) are converted to readable dates on export.
-# Date only:      "%Y-%m-%d"           -> 2026-07-23
-# Date and time:  "%Y-%m-%d %H:%M:%S"  -> 2026-07-23 14:05:11
+# Day/month/year: "%d/%m/%Y"           -> 23/07/2026
+# Year first:     "%Y-%m-%d"           -> 2026-07-23
+# With time:      "%d/%m/%Y %H:%M:%S"  -> 23/07/2026 14:05:11
 # Times are rendered in the machine's LOCAL timezone, matching how the
 # day boundaries in resolve_day_range are calculated.
-DATE_FORMAT: str = "%Y-%m-%d"
+DATE_FORMAT: str = "%d/%m/%Y"
 
 # Fields holding epoch seconds that should be formatted with DATE_FORMAT.
 EPOCH_FIELDS: set = {"timestamp", "_insertion_epoch_timestamp",
                      "_creation_timestamp", "src_time"}
+
+# Numeric fields that should be ADDED UP across rows collapsed by DEDUPE_ON,
+# rather than taking the first row's value. This is what makes the file size
+# column a genuine "Sum" per user+application pair instead of a single
+# event's size.
+SUM_FIELDS: set = {"file_size"}
+
+# Fields holding a byte count that should be converted to MB on export.
+BYTES_FIELDS: set = {"file_size"}
+
+# Decimal places for the MB conversion.
+MB_DECIMALS: int = 2
 
 # Rename the technical field names to the friendly headers you asked for.
 # Only applied to columns actually present in DESIRED_COLUMNS above.
@@ -183,6 +199,7 @@ RENAME_COLUMNS: Dict[str, str] = {
     "activity": "Activity",
     "object_type": "Object Type",
     "object": "Object Name",
+    "file_size": "Sum - File Size (MB)",
     "timestamp": "Event Date",
     "organization_unit": "Organization Unit",
     "action": "Action",
@@ -865,23 +882,49 @@ def dedupe_key(row: Dict[str, Any], fields: List[str]) -> Tuple[str, ...]:
     return tuple(key)
 
 
+def to_number(value: Any) -> float:
+    """Best-effort numeric coercion; anything unparseable counts as 0."""
+    if value is None or value == "":
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Collapse rows to unique combinations of DEDUPE_ON, keeping the first
     occurrence of each. Order is preserved. Rows missing a key field are
     treated as having a blank value for it rather than being dropped.
+
+    Fields listed in SUM_FIELDS are accumulated across every row that
+    collapses into the same key, so the kept row carries the total for that
+    user/application pair rather than just its first event's value.
     """
     if not DEDUPE_ON:
         return rows
 
-    seen: set = set()
+    index: Dict[Tuple[str, ...], Dict[str, Any]] = {}
     unique: List[Dict[str, Any]] = []
     for row in rows:
         key = dedupe_key(row, DEDUPE_ON)
-        if key in seen:
+        kept = index.get(key)
+
+        if kept is None:
+            row = dict(row)   # don't mutate the caller's data
+            for field in SUM_FIELDS:
+                if field in row:
+                    row[field] = to_number(row.get(field))
+            index[key] = row
+            unique.append(row)
             continue
-        seen.add(key)
-        unique.append(row)
+
+        # Duplicate: fold its summable values into the row we're keeping.
+        for field in SUM_FIELDS:
+            if field in row or field in kept:
+                kept[field] = to_number(kept.get(field)) + to_number(row.get(field))
+
     return unique
 
 
@@ -908,6 +951,19 @@ def format_epoch(value: Any) -> Any:
         return value          # out of range for the platform's localtime
 
 
+def bytes_to_mb(value: Any) -> Any:
+    """Convert a byte count to megabytes, rounded to MB_DECIMALS."""
+    if value is None or value == "":
+        return ""
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return value
+    if size <= 0:
+        return 0
+    return round(size / (1024 * 1024), MB_DECIMALS)
+
+
 def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> None:
     """
     Write to CSV with every discovered field as a column. Missing values are
@@ -932,6 +988,8 @@ def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> Non
     for column in frame.columns:
         if column in EPOCH_FIELDS:
             frame[column] = frame[column].apply(format_epoch)
+        elif column in BYTES_FIELDS:
+            frame[column] = frame[column].apply(bytes_to_mb)
 
     if RENAME_COLUMNS:
         frame = frame.rename(columns=RENAME_COLUMNS)
