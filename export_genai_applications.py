@@ -835,6 +835,23 @@ def discover_columns(rows: Iterable[Dict[str, Any]]) -> List[str]:
 # Export
 # ---------------------------------------------------------------------------
 
+def dedupe_key(row: Dict[str, Any], fields: List[str]) -> Tuple[str, ...]:
+    """
+    Build a normalized comparison key so trivially-different spellings of
+    the same user/app collapse together. Real Netskope data routinely mixes
+    'Alice@ABI.com' with 'alice@abi.com' and 'ChatGPT ' with 'ChatGPT', and
+    a raw string compare would treat those as distinct rows.
+
+    Normalization: casefold, strip, and collapse internal whitespace runs.
+    """
+    key: List[str] = []
+    for field in fields:
+        value = row.get(field, "")
+        text = "" if value is None else str(value)
+        key.append(" ".join(text.split()).casefold())
+    return tuple(key)
+
+
 def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Collapse rows to unique combinations of DEDUPE_ON, keeping the first
@@ -847,7 +864,7 @@ def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen: set = set()
     unique: List[Dict[str, Any]] = []
     for row in rows:
-        key = tuple(str(row.get(field, "")).strip() for field in DEDUPE_ON)
+        key = dedupe_key(row, DEDUPE_ON)
         if key in seen:
             continue
         seen.add(key)
@@ -860,8 +877,20 @@ def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> Non
     Write to CSV with every discovered field as a column. Missing values are
     written blank. QUOTE_MINIMAL keeps embedded commas safe. RENAME_COLUMNS,
     if set, relabels headers for columns that are actually present.
+
+    Dedupe is applied HERE rather than at the call sites, so that every
+    export path (full run, preview, anything added later) is guaranteed to
+    get it. dedupe_rows is idempotent, so calling it twice is harmless.
     """
+    rows = dedupe_rows(rows)
     frame = pd.DataFrame(rows, columns=columns)
+    # Trim stray leading/trailing whitespace so the CSV doesn't carry the
+    # padding that some source fields arrive with.
+    for column in frame.columns:
+        if frame[column].dtype == object:
+            frame[column] = frame[column].apply(
+                lambda v: v.strip() if isinstance(v, str) else v
+            )
     frame = frame.where(pd.notnull(frame), "")
     if RENAME_COLUMNS:
         frame = frame.rename(columns=RENAME_COLUMNS)
