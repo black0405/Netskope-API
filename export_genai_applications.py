@@ -82,6 +82,11 @@ REQUEST_TIMEOUT: int = 60      # seconds per HTTP request
 MAX_RETRIES: int = 5           # retries for 429 / 5xx / network errors
 BACKOFF_BASE: float = 2.0      # exponential backoff base, seconds
 
+# The datasearch endpoint takes its own server-side query timeout, in
+# seconds (Swagger marks it required, default 180). Raise it if large
+# windows start returning timeouts.
+QUERY_TIMEOUT: int = 180
+
 # Print the exact request (URL + params) and a snippet of every raw response
 # to the console. Turn this on FIRST if you're getting zero records -- it
 # will show you immediately whether the problem is auth, the filter, or the
@@ -93,15 +98,13 @@ DEBUG: bool = False
 # /events/data/ endpoints used "skip" -- change this if you switch back.
 OFFSET_PARAM_NAME: str = "offset"
 
-# The mandatory filter. Netskope stores this value lowercased.
-# category is frequently a MULTI-VALUE field on an app record (an app can
-# sit in several categories at once), and "eq" only matches when the field
-# holds exactly that one value -- against a list it typically matches
-# nothing, which is the most common reason this filter silently returns
-# zero rows. "in" checks membership instead, so it matches whether the
-# field is a single value or a list containing it. If your tenant's schema
-# really does store category as a single scalar, "equals" is still fine.
-BASE_FILTER_FIELD: str = "category"
+# The mandatory filter.
+# IMPORTANT: the field is `appcategory` (the CCI *application* category,
+# e.g. 'Cloud Storage', 'Generative AI'), NOT `category` -- `category` is
+# the web/URL category and is a different taxonomy. The tenant's Swagger
+# page documents the filter example as:
+#     query=appcategory eq 'Cloud Storage' and app eq 'Microsoft Office'
+BASE_FILTER_FIELD: str = "appcategory"
 BASE_FILTER_VALUE: str = "Generative AI"
 BASE_FILTER_OPERATOR: str = "in"
 
@@ -120,9 +123,6 @@ PREVIEW_LIMIT: int = 20
 # swap them if a preview run shows a better field for your tenant:
 #   Object Type       -> "type"   (no object_type field in this schema)
 #   Object Name       -> (none)   left as a placeholder, exports blank
-#   Sum-File Size(MB) -> "count"  (this event type carries NO bytes/size
-#                                  field, so a true MB sum isn't available
-#                                  here; "count" is the only numeric column)
 DESIRED_COLUMNS: List[str] = [
     "user",                # User
     "app",                 # Application
@@ -132,7 +132,6 @@ DESIRED_COLUMNS: List[str] = [
     "object_name",        # Object Name    (not in schema -> exports blank)
     "timestamp",          # Event Date     (epoch; see RENAME note)
     "organization_unit",   # Organization Unit
-    "count",              # Sum - File Size (MB)  (no size field -> count)
     # Uncomment to also see whether each row was allowed/blocked and whether
     # it raised an alert -- useful for confirming a block-only dataset:
     # "action",
@@ -151,6 +150,17 @@ PLACEHOLDER_COLUMNS: set = {"object_name"}
 # to pull every field (useful when exploring the schema in preview mode).
 SEND_FIELDS_PARAM: bool = True
 
+# Collapse the export to unique combinations of these fields. With
+# ["user", "app"] each user/application pair appears once, keeping the
+# values from that pair's first event for the remaining columns. Set to an
+# empty list to export every raw event row instead.
+#
+# NOTE: if you'd rather have a bare two-column list of distinct user/app
+# pairs with no other columns, also trim DESIRED_COLUMNS down to
+# ["user", "app"] -- the dedupe key and the exported columns are
+# independent on purpose.
+DEDUPE_ON: List[str] = ["user", "app"]
+
 # Rename the technical field names to the friendly headers you asked for.
 # Only applied to columns actually present in DESIRED_COLUMNS above.
 RENAME_COLUMNS: Dict[str, str] = {
@@ -162,7 +172,6 @@ RENAME_COLUMNS: Dict[str, str] = {
     "object_name": "Object Name",
     "timestamp": "Event Date",
     "organization_unit": "Organization Unit",
-    "count": "Sum - File Size (MB)",
     "action": "Action",
     "alert": "Alert",
 }
@@ -603,6 +612,7 @@ def fetch_window(
                 "endtime": endtime,
                 "limit": PAGE_SIZE,
                 OFFSET_PARAM_NAME: offset,
+                "timeout": QUERY_TIMEOUT,
             }
             selected = fields_param()
             if selected:
@@ -825,6 +835,26 @@ def discover_columns(rows: Iterable[Dict[str, Any]]) -> List[str]:
 # Export
 # ---------------------------------------------------------------------------
 
+def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Collapse rows to unique combinations of DEDUPE_ON, keeping the first
+    occurrence of each. Order is preserved. Rows missing a key field are
+    treated as having a blank value for it rather than being dropped.
+    """
+    if not DEDUPE_ON:
+        return rows
+
+    seen: set = set()
+    unique: List[Dict[str, Any]] = []
+    for row in rows:
+        key = tuple(str(row.get(field, "")).strip() for field in DEDUPE_ON)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique
+
+
 def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> None:
     """
     Write to CSV with every discovered field as a column. Missing values are
@@ -922,6 +952,7 @@ def run_preview(
         "endtime": end,
         "limit": PREVIEW_LIMIT,
         OFFSET_PARAM_NAME: 0,
+        "timeout": QUERY_TIMEOUT,
     }
     print(f"\nPreview: single call, limit={PREVIEW_LIMIT}, no windowing...")
     payload = request_page(session, url, params, stats)
@@ -1021,6 +1052,8 @@ def main() -> None:
 
     flat_rows = [flatten_record(r) for r in records]
     discovered = discover_columns(flat_rows)
+    raw_row_count = len(flat_rows)
+    flat_rows = dedupe_rows(flat_rows)
     if DESIRED_COLUMNS:
         missing = [c for c in DESIRED_COLUMNS if c not in discovered]
         if missing:
@@ -1033,7 +1066,10 @@ def main() -> None:
 
     print("\n" + "-" * 52)
     print(f"Day exported            : {label}")
-    print(f"Total records retrieved : {len(records)}")
+    print(f"Total records retrieved : {raw_row_count}")
+    if DEDUPE_ON:
+        print(f"Unique rows exported    : {len(flat_rows)} "
+              f"(by {'+'.join(DEDUPE_ON)})")
     print(f"Unique columns found    : {len(discovered)}")
     print(f"Columns exported        : {len(columns)}")
     print(f"API calls made          : {stats['calls']}")
