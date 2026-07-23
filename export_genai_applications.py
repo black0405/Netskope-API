@@ -167,12 +167,13 @@ SEND_FIELDS_PARAM: bool = True
 DEDUPE_ON: List[str] = ["user", "app"]
 
 # Epoch fields (like `timestamp`) are converted to readable dates on export.
+# Month/day/year: "%m/%d/%Y"           -> 07/23/2026
 # Day/month/year: "%d/%m/%Y"           -> 23/07/2026
 # Year first:     "%Y-%m-%d"           -> 2026-07-23
-# With time:      "%d/%m/%Y %H:%M:%S"  -> 23/07/2026 14:05:11
+# With time:      "%m/%d/%Y %H:%M:%S"  -> 07/23/2026 14:05:11
 # Times are rendered in the machine's LOCAL timezone, matching how the
 # day boundaries in resolve_day_range are calculated.
-DATE_FORMAT: str = "%d/%m/%Y"
+DATE_FORMAT: str = "%m/%d/%Y"
 
 # Fields holding epoch seconds that should be formatted with DATE_FORMAT.
 EPOCH_FIELDS: set = {"timestamp", "_insertion_epoch_timestamp",
@@ -189,6 +190,13 @@ BYTES_FIELDS: set = {"file_size"}
 
 # Decimal places for the MB conversion.
 MB_DECIMALS: int = 2
+
+# Prepend an unnamed leftmost column holding a row counter, so the first
+# data row (spreadsheet row 2, since row 1 is the header) is numbered
+# ROW_NUMBER_START. Set ROW_NUMBER_START = 2 if you want the values to
+# match the spreadsheet's own row numbers instead of counting from 1.
+ADD_ROW_NUMBER: bool = True
+ROW_NUMBER_START: int = 1
 
 # Rename the technical field names to the friendly headers you asked for.
 # Only applied to columns actually present in DESIRED_COLUMNS above.
@@ -993,6 +1001,16 @@ def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> Non
 
     if RENAME_COLUMNS:
         frame = frame.rename(columns=RENAME_COLUMNS)
+
+    # Unnamed leftmost counter column. Inserted last so it isn't affected by
+    # the rename map, and given an empty header name so the CSV's first
+    # column heading is blank.
+    if ADD_ROW_NUMBER:
+        frame.insert(
+            0, "",
+            range(ROW_NUMBER_START, ROW_NUMBER_START + len(frame)),
+        )
+
     frame.to_csv(path, index=False, quoting=csv.QUOTE_MINIMAL, encoding="utf-8")
 
 
