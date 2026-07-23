@@ -27,7 +27,12 @@ API_TOKEN: str = "PUT_YOUR_API_TOKEN_HERE"
 BASE_URL: str = "https://YOUR_TENANT.goskope.com"
 
 # Endpoint path (kept separate so other event types are a one-line change).
-ENDPOINT_PATH: str = "/api/v2/events/data/application"
+# NOTE: use the *datasearch* endpoint, not /events/data/. Per Netskope's
+# docs, the datasearch endpoints are the ones built on the Skope IT Query
+# Language and are what accept the `query` filter, `fields` column
+# selection, and groupbys/orderbys aggregation. This is the API equivalent
+# of Skope IT > Events & Alerts > Application Events.
+ENDPOINT_PATH: str = "/api/v2/events/datasearch/application"
 
 # Authentication style.
 #   "bearer"   -> Authorization: Bearer <token>        (requested / generic)
@@ -83,10 +88,10 @@ BACKOFF_BASE: float = 2.0      # exponential backoff base, seconds
 # response shape not matching what the script expects.
 DEBUG: bool = False
 
-# Name of the pagination query parameter. Netskope's own documented example
-# for this endpoint family is "skip" (e.g. limit=100&skip=0). If your tenant
-# actually uses "offset" instead, change it here.
-OFFSET_PARAM_NAME: str = "skip"
+# Name of the pagination query parameter. The datasearch endpoint documents
+# "offset" (number of rows to skip before presenting results). The older
+# /events/data/ endpoints used "skip" -- change this if you switch back.
+OFFSET_PARAM_NAME: str = "offset"
 
 # The mandatory filter. Netskope stores this value lowercased.
 # category is frequently a MULTI-VALUE field on an app record (an app can
@@ -128,7 +133,23 @@ DESIRED_COLUMNS: List[str] = [
     "timestamp",          # Event Date     (epoch; see RENAME note)
     "organization_unit",   # Organization Unit
     "count",              # Sum - File Size (MB)  (no size field -> count)
+    # Uncomment to also see whether each row was allowed/blocked and whether
+    # it raised an alert -- useful for confirming a block-only dataset:
+    # "action",
+    # "alert",
 ]
+
+# Columns in DESIRED_COLUMNS that do NOT exist in the API schema. They are
+# still written to the CSV (blank) but are never sent in the `fields`
+# parameter, since asking the API for an unknown field can fail the query.
+PLACEHOLDER_COLUMNS: set = {"object_name"}
+
+# Ask the API to return ONLY the fields we actually export, via the
+# datasearch `fields` parameter (e.g. fields=app,category). This cuts the
+# response from ~100 fields per row down to the handful you need, which is
+# the single biggest speed-up available for a full-day pull. Set to False
+# to pull every field (useful when exploring the schema in preview mode).
+SEND_FIELDS_PARAM: bool = True
 
 # Rename the technical field names to the friendly headers you asked for.
 # Only applied to columns actually present in DESIRED_COLUMNS above.
@@ -142,6 +163,8 @@ RENAME_COLUMNS: Dict[str, str] = {
     "timestamp": "Event Date",
     "organization_unit": "Organization Unit",
     "count": "Sum - File Size (MB)",
+    "action": "Action",
+    "alert": "Alert",
 }
 
 # ---------------------------------------------------------------------------
@@ -518,6 +541,18 @@ def extract_cursor(payload: Dict[str, Any]) -> Optional[str]:
 # Pagination
 # ---------------------------------------------------------------------------
 
+def fields_param() -> Optional[str]:
+    """
+    Comma-separated field list for the datasearch `fields` parameter, or
+    None to let the API return everything. Placeholder columns that don't
+    exist in the schema are excluded so they can't fail the query.
+    """
+    if not SEND_FIELDS_PARAM or not DESIRED_COLUMNS:
+        return None
+    real = [c for c in DESIRED_COLUMNS if c not in PLACEHOLDER_COLUMNS]
+    return ",".join(real) if real else None
+
+
 def render_progress(stats: Dict[str, int], bar_width: int = 28) -> None:
     """
     Draw a single-line, in-place progress bar (overwrites itself with \r
@@ -569,6 +604,9 @@ def fetch_window(
                 "limit": PAGE_SIZE,
                 OFFSET_PARAM_NAME: offset,
             }
+            selected = fields_param()
+            if selected:
+                params["fields"] = selected
 
         payload = request_page(session, target, params, stats)
 
@@ -876,6 +914,8 @@ def run_preview(
     preview_ CSV too, in case the console truncates long field lists.
     """
     url = BASE_URL.rstrip("/") + ENDPOINT_PATH
+    # Deliberately NOT sending `fields` here -- preview should show the full
+    # schema so you can confirm real field names and value distributions.
     params = {
         "query": query,
         "starttime": start,
@@ -896,6 +936,21 @@ def run_preview(
     columns = discover_columns(flat_rows)
     print(f"  Got {len(records)} sample record(s).")
     print(f"  Fields found: {', '.join(columns)}")
+
+    # Value distribution for the fields that explain "why am I only seeing X".
+    # Nothing in the query filters on these -- so whatever shows up here is
+    # simply what the endpoint returns for the category filter. If action is
+    # 100% block, that's the tenant's policy/feed, not this script.
+    for field in ("action", "alert", "activity", "traffic_type", "type"):
+        if field not in columns:
+            continue
+        counts: Dict[str, int] = {}
+        for row in flat_rows:
+            value = str(row.get(field, "")).strip() or "(blank)"
+            counts[value] = counts.get(value, 0) + 1
+        breakdown = ", ".join(f"{v}={n}" for v, n in
+                              sorted(counts.items(), key=lambda kv: -kv[1]))
+        print(f"    {field}: {breakdown}")
 
     preview_path = "preview_" + OUTPUT_FILE
     export_csv(flat_rows, DESIRED_COLUMNS or columns, preview_path)
