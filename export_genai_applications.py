@@ -121,15 +121,17 @@ PREVIEW_LIMIT: int = 20
 # Mapped from the requested business columns to the REAL Netskope field
 # names in this event schema. Three had no clean match -- see the comments;
 # swap them if a preview run shows a better field for your tenant:
-#   Object Type       -> "type"   (no object_type field in this schema)
-#   Object Name       -> (none)   left as a placeholder, exports blank
+#   Object Type       -> "object_type"  (File / Folder / Message ...)
+#   Object Name       -> "object"       (the named object, when the event
+#                                        involves one -- blank otherwise)
 DESIRED_COLUMNS: List[str] = [
     "user",                # User
     "app",                 # Application
     "url",                 # URL
     "activity",            # Activity
-    "type",               # Object Type   (closest available)
-    "object_name",        # Object Name    (not in schema -> exports blank)
+    "object_type",         # Object Type  (NOT `type` -- that's the event
+                           #   type: nspolicy/connection/etc.)
+    "object",              # Object Name  (the named file/folder/message)
     "timestamp",          # Event Date     (epoch; see RENAME note)
     "organization_unit",   # Organization Unit
     # Uncomment to also see whether each row was allowed/blocked and whether
@@ -141,7 +143,7 @@ DESIRED_COLUMNS: List[str] = [
 # Columns in DESIRED_COLUMNS that do NOT exist in the API schema. They are
 # still written to the CSV (blank) but are never sent in the `fields`
 # parameter, since asking the API for an unknown field can fail the query.
-PLACEHOLDER_COLUMNS: set = {"object_name"}
+PLACEHOLDER_COLUMNS: set = set()
 
 # Ask the API to return ONLY the fields we actually export, via the
 # datasearch `fields` parameter (e.g. fields=app,category). This cuts the
@@ -161,6 +163,17 @@ SEND_FIELDS_PARAM: bool = True
 # independent on purpose.
 DEDUPE_ON: List[str] = ["user", "app"]
 
+# Epoch fields (like `timestamp`) are converted to readable dates on export.
+# Date only:      "%Y-%m-%d"           -> 2026-07-23
+# Date and time:  "%Y-%m-%d %H:%M:%S"  -> 2026-07-23 14:05:11
+# Times are rendered in the machine's LOCAL timezone, matching how the
+# day boundaries in resolve_day_range are calculated.
+DATE_FORMAT: str = "%Y-%m-%d"
+
+# Fields holding epoch seconds that should be formatted with DATE_FORMAT.
+EPOCH_FIELDS: set = {"timestamp", "_insertion_epoch_timestamp",
+                     "_creation_timestamp", "src_time"}
+
 # Rename the technical field names to the friendly headers you asked for.
 # Only applied to columns actually present in DESIRED_COLUMNS above.
 RENAME_COLUMNS: Dict[str, str] = {
@@ -168,8 +181,8 @@ RENAME_COLUMNS: Dict[str, str] = {
     "app": "Application",
     "url": "URL",
     "activity": "Activity",
-    "type": "Object Type",
-    "object_name": "Object Name",
+    "object_type": "Object Type",
+    "object": "Object Name",
     "timestamp": "Event Date",
     "organization_unit": "Organization Unit",
     "action": "Action",
@@ -872,6 +885,29 @@ def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return unique
 
 
+def format_epoch(value: Any) -> Any:
+    """
+    Convert an epoch-seconds value to a readable date using DATE_FORMAT.
+
+    Returns the original value untouched if it isn't a usable epoch --
+    blanks stay blank, and any field that already holds a formatted string
+    (some Netskope time fields do) passes through rather than being
+    mangled into a wrong date.
+    """
+    if value is None or value == "":
+        return ""
+    try:
+        epoch = float(value)
+    except (TypeError, ValueError):
+        return value          # already a string date, or something else
+    if epoch <= 0:
+        return ""
+    try:
+        return time.strftime(DATE_FORMAT, time.localtime(epoch))
+    except (ValueError, OSError, OverflowError):
+        return value          # out of range for the platform's localtime
+
+
 def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> None:
     """
     Write to CSV with every discovered field as a column. Missing values are
@@ -892,6 +928,11 @@ def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> Non
                 lambda v: v.strip() if isinstance(v, str) else v
             )
     frame = frame.where(pd.notnull(frame), "")
+    # Convert epoch fields to readable dates before headers get renamed.
+    for column in frame.columns:
+        if column in EPOCH_FIELDS:
+            frame[column] = frame[column].apply(format_epoch)
+
     if RENAME_COLUMNS:
         frame = frame.rename(columns=RENAME_COLUMNS)
     frame.to_csv(path, index=False, quoting=csv.QUOTE_MINIMAL, encoding="utf-8")
