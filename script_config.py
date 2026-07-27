@@ -707,7 +707,9 @@ def prompt_for_date_range() -> Tuple[int, int, str]:
     blocks waiting on input that will never arrive.
     """
     # 1. Command line wins.
-    cli_date = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+    # First non-flag argument, if any, is treated as the date.
+    cli_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    cli_date = cli_args[0].strip() if cli_args else ""
     if cli_date:
         try:
             parsed = time.strptime(cli_date, "%Y-%m-%d")
@@ -1146,11 +1148,27 @@ def get_graph_token() -> str:
 def graph_get(session: requests.Session, url: str) -> Dict[str, Any]:
     """GET a Graph endpoint and return the decoded JSON, or raise."""
     response = session.get(url, timeout=REQUEST_TIMEOUT)
-    if response.status_code == 403:
+
+    # Both of these mean the same thing under Sites.Selected: the app
+    # authenticated fine but has no permission on THIS site. SharePoint
+    # reports it inconsistently -- sometimes a clean 403, sometimes a 401
+    # wrapped as "generalException / spException". Treat them together.
+    body = response.text or ""
+    is_site_grant_issue = (
+        response.status_code == 403
+        or (response.status_code == 401 and
+            ("spException" in body or "generalException" in body))
+    )
+    if is_site_grant_issue:
         raise UploadError(
-            f"Graph returned 403 Forbidden for {url}. With Sites.Selected "
-            f"this usually means the app has the API permission but has NOT "
-            f"been granted access to this specific site yet."
+            f"Graph returned {response.status_code} for {url}.\n"
+            f"  This is the classic Sites.Selected symptom: the app has the "
+            f"API permission but has NOT been granted access to this "
+            f"specific site.\n"
+            f"  The API permission alone grants nothing -- an admin must run "
+            f"the site-level grant once.\n"
+            f"  Run  python {sys.argv[0].rsplit('/', 1)[-1]} --grant-help  "
+            f"for the exact command."
         )
     if not response.ok:
         raise UploadError(
@@ -1158,6 +1176,48 @@ def graph_get(session: requests.Session, url: str) -> Dict[str, Any]:
             f"{response.text[:300]}"
         )
     return response.json()
+
+
+def print_grant_help() -> None:
+    """
+    Print the one-time site-permission grant an admin needs to run, with the
+    app's own IDs filled in. This is what fixes the 401/403 spException.
+    """
+    try:
+        _, client, _ = graph_credentials()
+    except UploadError:
+        client = CLIENT_ID
+
+    path = SITE_PATH if SITE_PATH.startswith("/") else "/" + SITE_PATH
+    print("=" * 70)
+    print("ONE-TIME SharePoint site grant (run by a SharePoint / Graph admin)")
+    print("=" * 70)
+    print()
+    print("Sites.Selected grants NO access until the app is granted rights on")
+    print("the specific site. Do that once with the two calls below.")
+    print()
+    print("STEP 1 -- get the site id (any admin token with Sites.Read.All):")
+    print(f"  GET {GRAPH_ROOT}/sites/{SITE_HOSTNAME}:{path}")
+    print("  -> copy the \"id\" from the response")
+    print()
+    print("STEP 2 -- grant this app WRITE on that site:")
+    print(f"  POST {GRAPH_ROOT}/sites/{{site-id}}/permissions")
+    print("  Content-Type: application/json")
+    print()
+    print("  {")
+    print('    "roles": ["write"],')
+    print('    "grantedToIdentities": [{')
+    print('      "application": {')
+    print(f'        "id": "{client}",')
+    print('        "displayName": "Netskope GenAI Export"')
+    print("      }")
+    print("    }]")
+    print("  }")
+    print()
+    print("Both steps can be run from Graph Explorer (aka.ms/ge) signed in as")
+    print("an admin, or via PowerShell (Get-MgSite / New-MgSitePermission).")
+    print("After the grant, re-run the export normally.")
+    print("=" * 70)
 
 
 def resolve_site_id(session: requests.Session) -> str:
@@ -1336,7 +1396,8 @@ def main() -> int:
         except FileNotFoundError:
             pass
 
-    day_source = "cli" if len(sys.argv) > 1 else DAY_MODE
+    day_source = "cli" if [a for a in sys.argv[1:] if not a.startswith("-")] \
+        else DAY_MODE
     print(f"\n{label} ({day_source})  |  {query}")
     print(f"{BASE_URL.rstrip('/')}{ENDPOINT_PATH}")
 
@@ -1405,5 +1466,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--grant-help" in sys.argv:
+        print_grant_help()
+        sys.exit(0)
     # Exit code lets Task Scheduler / cron flag a failed run.
     sys.exit(main())
