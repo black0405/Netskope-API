@@ -952,6 +952,84 @@ def peek(session: requests.Session, query: str, start: int, end: int,
 
 
 # ===========================================================================
+# Probe -- find which byte fields this tenant actually supports
+# ===========================================================================
+
+
+def probe(session: requests.Session, query: str, start: int, end: int,
+          stats: Dict[str, int]) -> None:
+    """
+    Test candidate aggregate expressions one at a time against the live API
+    and report which work.
+
+    This exists because the raw field name and the aggregate output name
+    differ: Netskope's own example sums `client_bytes_total` but returns it
+    as `client_bytes`. A raw --peek therefore may not show the field even
+    when the aggregation works fine. The only reliable test is to ask.
+    """
+    candidates = [
+        "numbytes_total", "numbytes",
+        "client_bytes_total", "client_bytes",
+        "server_bytes_total", "server_bytes",
+        "bytes", "bytes_total",
+        "session_number_unique", "count",
+    ]
+
+    print(f"\nProbe: testing {len(candidates)} candidate field(s) on "
+          f"{ENDPOINT_PATH}")
+    print(f"  groupby = {','.join(GROUP_BY)}\n")
+
+    working: List[Tuple[str, Any]] = []
+    for field in candidates:
+        params = {
+            "query": query,
+            "starttime": start,
+            "endtime": end,
+            "groupby": ",".join(GROUP_BY),
+            "fields": f"probe=sum({field})",
+            "limit": 1,
+            "offset": 0,
+            "timeout": QUERY_TIMEOUT,
+        }
+        try:
+            rows = extract_records(request_page(session, params, stats))
+        except ApiError as exc:
+            reason = str(exc)[:70].replace("\n", " ")
+            print(f"    {field:<24} REJECTED   {reason}")
+            continue
+
+        if not rows:
+            print(f"    {field:<24} accepted, but no rows returned")
+            continue
+
+        value = rows[0].get("probe")
+        marker = "OK" if value not in (None, "", 0) else "zero"
+        print(f"    {field:<24} {marker:<10} sample={value}")
+        if marker == "OK":
+            working.append((field, value))
+
+    print()
+    if working:
+        print("  Usable fields:")
+        for field, value in working:
+            print(f"    {field}  (e.g. {value})")
+        print("\n  Put the winners into AGGREGATIONS, e.g.")
+        print("    AGGREGATIONS = {")
+        for out, guess in (("numbytes", "numbytes"),
+                           ("server_bytes", "server_bytes"),
+                           ("client_bytes", "client_bytes")):
+            match = next((f for f, _v in working if f.startswith(guess)), None)
+            if match:
+                print(f'        "{out}": "sum({match})",')
+        print("    }")
+    else:
+        print("  No candidate returned usable data.")
+        print("  Either this event type carries no byte counts, or the")
+        print("  filter matched nothing for this day. Try widening the day")
+        print("  or running with FILTER_VALUE set to a busier category.")
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -986,6 +1064,10 @@ def main() -> int:
     try:
         if "--peek" in sys.argv:
             peek(session, query, start, end, stats)
+            return 0
+
+        if "--probe" in sys.argv:
+            probe(session, query, start, end, stats)
             return 0
 
         records: List[Dict[str, Any]] = []
