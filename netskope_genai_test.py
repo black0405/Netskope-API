@@ -56,6 +56,17 @@ BASE_FILTER_FIELD: str = "appcategory"
 BASE_FILTER_VALUE: str = "Generative AI"
 BASE_FILTER_OPERATOR: str = "in"          # in | equals
 
+# Rows must have a non-blank value in EVERY one of these to be exported.
+# Some events carry only org/department metadata with no user or app
+# attached -- those are useless in a per-user usage report, so they are
+# dropped. Set to [] to keep everything.
+REQUIRE_FIELDS: List[str] = ["user", "app"]
+
+# Values that count as "no real value" in the check above. These show up
+# in Netskope data as placeholders rather than true blanks.
+BLANK_VALUES: Tuple[str, ...] = ("", "-", "n/a", "na", "null", "none",
+                                 "unknown", "unknown user", "0")
+
 # --- Which day to pull ------------------------------------------------------
 # "yesterday" | "today" | "date" | "rolling"
 # A date on the command line overrides this:
@@ -1149,6 +1160,63 @@ def flatten_record(
     return out
 
 
+def has_required_fields(row: Dict[str, Any]) -> bool:
+    """
+    True if the row carries a real value in every REQUIRE_FIELDS entry.
+
+    Netskope emits some events with only org/department metadata and no
+    user or app -- they are valid events, but meaningless in a per-user
+    per-application usage report, and they show up as rows that look like
+    just an OU path with nothing else filled in.
+    """
+    for field in REQUIRE_FIELDS:
+        value = row.get(field)
+        if value is None:
+            return False
+        text = " ".join(str(value).split()).strip().casefold()
+        if text in BLANK_VALUES:
+            return False
+    return True
+
+
+def drop_incomplete(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Remove rows missing any REQUIRE_FIELDS value, reporting the count and
+    which field was responsible. Dropping is destructive, so it is never
+    silent -- a large count means the query is returning something
+    unexpected and is worth a look.
+    """
+    if not REQUIRE_FIELDS:
+        return rows
+
+    kept: List[Dict[str, Any]] = []
+    reasons: Dict[str, int] = {}
+
+    for row in rows:
+        if has_required_fields(row):
+            kept.append(row)
+            continue
+        for field in REQUIRE_FIELDS:
+            value = row.get(field)
+            text = "" if value is None else \
+                " ".join(str(value).split()).strip().casefold()
+            if text in BLANK_VALUES:
+                reasons[field] = reasons.get(field, 0) + 1
+                break
+
+    dropped = len(rows) - len(kept)
+    if dropped:
+        detail = ", ".join(f"no {f} ({n})" for f, n in
+                           sorted(reasons.items(), key=lambda kv: -kv[1]))
+        log.info("Dropped %d of %d row(s) with no user/app -- %s",
+                 dropped, len(rows), detail)
+        if dropped > len(rows) * 0.5:
+            log.warning("Over half the rows were dropped -- worth checking "
+                        "the query before trusting this export.")
+
+    return kept
+
+
 def discover_columns(rows: Iterable[Dict[str, Any]]) -> List[str]:
     """
     Union of every key across every flattened record, in first-seen order.
@@ -2018,6 +2086,15 @@ def main() -> int:
     resolve_byte_aliases(flat_rows)
     discovered = discover_columns(flat_rows)
     raw_row_count = len(flat_rows)
+
+    # Drop org-only rows BEFORE dedupe, so a blank-user row can't collapse
+    # into a real one and drag its bytes along.
+    flat_rows = drop_incomplete(flat_rows)
+    if not flat_rows:
+        log.warning("Every row lacked a user/app value -- nothing written.")
+        write_status(label, result="no_usable_rows", rows=0, uploaded=False)
+        return finish(3, started, run_id)
+
     flat_rows = dedupe_rows(flat_rows)
 
     if DESIRED_COLUMNS:
