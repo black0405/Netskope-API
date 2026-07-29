@@ -485,6 +485,18 @@ DESIRED_COLUMNS: List[str] = [
 # kept as fallbacks. First one present in the data wins.
 #   ingress_client_bytes -> UPLOADED   (traffic in from the end-user client)
 #   ingress_server_bytes -> DOWNLOADED (the return leg)
+# Non-byte fields that also vary by name between event types/schemas.
+# Same mechanism as the byte aliases: the first name present in the data
+# wins and is copied onto the canonical name used in DESIRED_COLUMNS.
+TEXT_FIELD_ALIASES: Dict[str, List[str]] = {
+    "usergroup": ["usergroup", "user_group", "usergroups", "user_groups",
+                  "groups", "group", "ad_group", "userGroup"],
+    "organization_unit": ["organization_unit", "org_unit", "orgunit", "ou",
+                          "organizationunit", "organization",
+                          "organizationUnit", "user_ou"],
+    "activity": ["activity", "action", "operation", "event_activity"],
+}
+
 BYTE_FIELD_ALIASES: Dict[str, List[str]] = {
     "numbytes":     ["numbytes", "numbytes_total", "total_bytes", "bytes"],
     "server_bytes": ["ingress_server_bytes", "server_bytes",
@@ -846,44 +858,70 @@ def fields_param() -> Optional[str]:
     for column in DESIRED_COLUMNS:
         if column in PLACEHOLDER_COLUMNS:
             continue
-        # Ask for every known alias of a byte field, since the exact name
-        # varies by schema. Unknown names are ignored by the API.
-        for name in BYTE_FIELD_ALIASES.get(column, [column]):
+        # Ask for every known alias, since the exact name varies by schema
+        # and event type. Unknown names are ignored by the API rather than
+        # rejected -- and NOT asking is why a column comes back blank.
+        aliases = (BYTE_FIELD_ALIASES.get(column)
+                   or TEXT_FIELD_ALIASES.get(column)
+                   or [column])
+        for name in aliases:
             if name not in wanted:
                 wanted.append(name)
 
     return ",".join(wanted) if wanted else None
 
 
-def resolve_byte_aliases(rows: List[Dict[str, Any]]) -> None:
+def resolve_field_aliases(rows: List[Dict[str, Any]]) -> None:
     """
-    Normalise byte-field naming, in place.
+    Normalise field naming, in place, for both byte and text columns.
 
     Whichever alias the tenant actually returned is copied onto the
     canonical name used in DESIRED_COLUMNS, so the export doesn't care
-    whether the schema says `numbytes` or `numbytes_total`. Logs which
-    alias won, so an empty byte column is diagnosable at a glance.
+    whether the schema says `organization_unit` or `org_unit`, `usergroup`
+    or `user_groups`. Logs which alias won -- an empty column is then
+    diagnosable at a glance instead of being a silent blank.
+
+    A canonical name that exists but is blank on EVERY row is treated as
+    absent, so an alias that does carry data still gets picked up.
     """
     if not rows:
         return
 
+    sample = rows[:200]
+
+    def has_data(field: str) -> bool:
+        return any(str(r.get(field, "")).strip() not in ("", "None")
+                   for r in sample)
+
     present: set = set()
-    for row in rows[:50]:          # sampling is enough to spot the schema
+    for row in sample:
         present.update(row.keys())
 
-    for canonical, aliases in BYTE_FIELD_ALIASES.items():
-        if canonical in present:
-            continue               # already the right name
+    all_aliases: Dict[str, List[str]] = {}
+    all_aliases.update(BYTE_FIELD_ALIASES)
+    all_aliases.update(TEXT_FIELD_ALIASES)
 
-        match = next((a for a in aliases if a in present), None)
+    for canonical, aliases in all_aliases.items():
+        if canonical not in DESIRED_COLUMNS:
+            continue
+        if canonical in present and has_data(canonical):
+            continue               # already correct and populated
+
+        match = next((a for a in aliases
+                      if a != canonical and a in present and has_data(a)),
+                     None)
         if match:
-            log.info("byte field  %s -> using '%s'", canonical, match)
+            log.info("field  %s -> using '%s'", canonical, match)
             for row in rows:
                 if match in row:
                     row[canonical] = row[match]
+        elif canonical in present:
+            log.warning("field  %s is present but EMPTY on every row "
+                        "(no populated alternative among: %s)",
+                        canonical, ", ".join(aliases))
         else:
-            log.warning("byte field  %s NOT FOUND (tried: %s) -- that column "
-                        "will export as 0", canonical, ", ".join(aliases))
+            log.warning("field  %s NOT FOUND (tried: %s) -- exports blank",
+                        canonical, ", ".join(aliases))
 
 
 def render_progress(stats: Dict[str, int], bar_width: int = 28) -> None:
@@ -2075,6 +2113,47 @@ def run_check(run_id: str, started: float) -> int:
     return finish(0, started, run_id)
 
 
+def peek(session: requests.Session, start: int, end: int,
+         stats: Dict[str, int]) -> None:
+    """
+    Pull a few records with NO field restriction and print every key with a
+    sample value, so you can see exactly what this endpoint returns rather
+    than guessing at field names.
+    """
+    url = BASE_URL.rstrip("/") + ENDPOINT_PATH
+    params = {
+        "query": build_query(),
+        "starttime": start,
+        "endtime": end,
+        "limit": 5,
+        OFFSET_PARAM_NAME: 0,
+        "timeout": QUERY_TIMEOUT,
+    }
+    print(f"\nPeek: 5 records, all fields, from {ENDPOINT_PATH}\n")
+    rows = [flatten_record(r) for r in
+            extract_records(request_page(session, url, params, stats))]
+
+    if not rows:
+        print("  No records returned for this filter/day.")
+        return
+
+    keys = sorted({k for row in rows for k in row})
+    print(f"  {len(rows)} record(s), {len(keys)} distinct fields:\n")
+    for key in keys:
+        sample = next((row[key] for row in rows
+                       if row.get(key) not in (None, "")), "")
+        print(f"    {key:<32} {str(sample)[:46]}")
+
+    print("\n  Fields that look activity-like:")
+    hits = [k for k in keys if any(t in k.lower() for t in
+            ("activ", "action", "operation", "method", "type", "event"))]
+    print("   ", ", ".join(hits) if hits else "(none found)")
+
+    print("\n  Columns you asked for that are MISSING here:")
+    missing = [c for c in DESIRED_COLUMNS if c not in keys]
+    print("   ", ", ".join(missing) if missing else "(none -- all present)")
+
+
 def main() -> int:
     """
     Returns a process exit code so a scheduler can detect failures:
@@ -2146,6 +2225,14 @@ def main() -> int:
 
     session = build_session()
 
+    if "--peek" in sys.argv:
+        try:
+            peek(session, start, end, stats)
+        except ApiError as exc:
+            log.error("Peek failed: %s", exc)
+            return finish(2, started, run_id)
+        return finish(0, started, run_id)
+
     log.info("Fetching from Netskope...")
     try:
         records = fetch_all(session, query, start, end, stats)
@@ -2175,7 +2262,7 @@ def main() -> int:
         return finish(3, started, run_id)
 
     flat_rows = [flatten_record(r) for r in records]
-    resolve_byte_aliases(flat_rows)
+    resolve_field_aliases(flat_rows)
     discovered = discover_columns(flat_rows)
     raw_row_count = len(flat_rows)
 
