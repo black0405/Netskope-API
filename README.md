@@ -115,7 +115,7 @@ NETSKOPE_CONFIG_FILE=/etc/netskope/prod.env python export_genai_applications.py
   production hosts
 - The SPN needs Microsoft Graph **`Sites.Selected`** (application
   permission) *plus* a site-level grant on the target site. The API
-  permission alone grants nothing — run `--grant-help` for the command
+  permission alone grants nothing run `--grant-help` for the command
 - Client secrets expire; when they do the export keeps working and only
   the upload fails (exit 4). Worth a calendar reminder
 
