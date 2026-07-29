@@ -468,6 +468,7 @@ DESIRED_COLUMNS: List[str] = [
     "app",                 # Application
     "user",                # User
     "url",                 # URL
+    "activity",            # Activity  (Upload / Download / Login / Browse)
     "timestamp",           # Event Date  (epoch -> DATE_FORMAT)
     "usergroup",           # User Group
     "organization_unit",   # Organization Unit
