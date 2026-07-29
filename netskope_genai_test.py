@@ -84,12 +84,17 @@ MB_DECIMALS: int = 2
 # is dropped when a field contains an embedded newline / carriage return,
 # or is longer than MAX_FIELD_LENGTH -- both indicate the multi-value blob
 # that corrupts the CSV.
+# Only a genuine CSV-breaker (an embedded newline, or a list value) drops
+# a row. Length alone does NOT -- these OU and group paths are legitimately
+# long, and dropping on length silently discarded almost the whole export.
 DROP_MALFORMED_ROWS: bool = True
-MAX_FIELD_LENGTH: int = 300
 
-# Which fields are checked. Byte and date columns are never checked.
-CHECK_FIELDS: List[str] = ["user", "app", "url", "usergroup",
-                           "organization_unit"]
+# 0 disables the length check entirely. Set a number only if you want long
+# values gone as well.
+MAX_FIELD_LENGTH: int = 0
+
+# Which fields are checked for line breaks. Byte and date columns never are.
+CHECK_FIELDS: List[str] = ["user", "app", "url", "organization_unit"]
 
 # --- Behaviour -------------------------------------------------------------
 PAGE_SIZE: int = 5000                # Netskope caps at 10000
@@ -150,25 +155,35 @@ GROUP_BY: List[str] = ["user", "app", "organization_unit"]
 # Aggregate expressions: output name -> the sum() over the source field.
 # If a run errors with "unknown field", peek first and adjust the inner
 # names to whatever your tenant actually exposes.
-# Confirmed from Netskope's documented example on the page endpoint:
-#   fields=server_bytes=sum(server_bytes_total),
-#          client_bytes=sum(client_bytes_total),
-#          numbytes=sum(numbytes_total)
+# Direction mapping for this tenant:
+#   ingress_client_bytes -> Bytes UPLOADED   (traffic into Netskope from
+#                                             the end-user client)
+#   ingress_server_bytes -> Bytes DOWNLOADED (the return leg)
+#   numbytes             -> Total Bytes
 #
-#   client_bytes = bytes FROM the end-user client  -> Bytes Uploaded
-#   server_bytes = bytes FROM the destination site -> Bytes Downloaded
+# The plain client_bytes / server_bytes fields also exist here. They are
+# kept as the fallback below, so if the ingress_* figures don't tie out
+# against Skope IT you can swap the two sets over without editing anything
+# else.
 AGGREGATIONS: Dict[str, str] = {
-    "numbytes":     "sum(numbytes_total)",
-    "server_bytes": "sum(server_bytes_total)",
-    "client_bytes": "sum(client_bytes_total)",
+    "numbytes":     "sum(numbytes)",
+    "client_bytes": "sum(ingress_client_bytes)",   # uploaded
+    "server_bytes": "sum(ingress_server_bytes)",   # downloaded
 }
 
 # Fallback aggregate expressions tried if the first set is rejected.
 AGGREGATION_FALLBACKS: List[Dict[str, str]] = [
+    # Plain (non-ingress) counters.
     {
         "numbytes":     "sum(numbytes)",
-        "server_bytes": "sum(server_bytes)",
         "client_bytes": "sum(client_bytes)",
+        "server_bytes": "sum(server_bytes)",
+    },
+    # The "_total" variants from Netskope's documented example.
+    {
+        "numbytes":     "sum(numbytes_total)",
+        "client_bytes": "sum(client_bytes_total)",
+        "server_bytes": "sum(server_bytes_total)",
     },
 ]
 
@@ -210,8 +225,10 @@ ROW_NUMBER_HEADER: str = "S.No."
 BYTE_ALIASES: Dict[str, List[str]] = {
     "numbytes":     ["numbytes", "numbytes_total", "total_bytes", "bytes"],
     "server_bytes": ["server_bytes", "server_bytes_total",
+                     "ingress_server_bytes",
                      "bytes_downloaded", "download_bytes"],
     "client_bytes": ["client_bytes", "client_bytes_total",
+                     "ingress_client_bytes",
                      "bytes_uploaded", "upload_bytes"],
 }
 
@@ -497,31 +514,53 @@ def fetch_aggregate(session: requests.Session, query: str,
     back to raw mode); raises for genuine failures like auth.
     """
     field_expr = ",".join(f"{out}={expr}" for out, expr in aggregations.items())
-    params = {
-        "query": query,
-        "starttime": start,
-        "endtime": end,
-        "groupby": ",".join(GROUP_BY),
-        "fields": field_expr,
-        "limit": PAGE_SIZE,
-        "offset": 0,
-        "timeout": QUERY_TIMEOUT,
-    }
 
-    print(f"  groupby : {params['groupby']}")
+    print(f"  groupby : {','.join(GROUP_BY)}")
     print(f"  fields  : {field_expr}")
 
-    try:
-        rows = extract_records(request_page(session, params, stats))
-    except ApiError as exc:
-        message = str(exc)
-        # A rejected aggregation is a 400 about the query/fields -- that's
-        # recoverable, so signal a fallback rather than dying.
-        if "400" in message or "unknown" in message.lower():
-            print(f"  ! aggregation rejected: {message[:160]}")
-            return None
-        raise
+    rows: List[Dict[str, Any]] = []
+    offset = 0
 
+    # Aggregated responses are paginated too. The first version fetched a
+    # single page and stopped, which silently truncated the export to
+    # whatever fitted in one response.
+    while True:
+        params = {
+            "query": query,
+            "starttime": start,
+            "endtime": end,
+            "groupby": ",".join(GROUP_BY),
+            "fields": field_expr,
+            "limit": PAGE_SIZE,
+            "offset": offset,
+            "timeout": QUERY_TIMEOUT,
+        }
+
+        try:
+            page = extract_records(request_page(session, params, stats))
+        except ApiError as exc:
+            message = str(exc)
+            # A rejected aggregation is recoverable -- signal a fallback.
+            # Only treat the FIRST page that way; a failure mid-pagination
+            # is a real error and shouldn't silently return partial data.
+            if offset == 0 and ("400" in message or
+                                "unknown" in message.lower()):
+                print(f"  ! aggregation rejected: {message[:160]}")
+                return None
+            raise
+
+        if not page:
+            break
+
+        rows.extend(page)
+        print(f"\r  fetched {len(rows):>7} group(s)", end="", flush=True)
+
+        if len(page) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+
+    if rows:
+        print()
     return rows
 
 
@@ -746,7 +785,7 @@ def is_malformed(row: Dict[str, Any]) -> Optional[str]:
         text = str(value)
         if "\n" in text or "\r" in text:
             return f"{field} contains a line break"
-        if len(text) > MAX_FIELD_LENGTH:
+        if MAX_FIELD_LENGTH and len(text) > MAX_FIELD_LENGTH:
             return f"{field} is {len(text)} chars (limit {MAX_FIELD_LENGTH})"
 
     return None
