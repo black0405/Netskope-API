@@ -79,9 +79,17 @@ BLANK_VALUES: Tuple[str, ...] = ("", "-", "n/a", "na", "null", "none",
 #                  ".../Managed Groups/BRAHMA/BRAHMA-PG_GERAL" -> "BRAHMA-PG_GERAL"
 MULTIVALUE_FIELDS: Tuple[str, ...] = ("usergroup", "user_group", "groups",
                                       "department", "organization_unit")
+
+# Keep only the FIRST value when a field carries several, and keep it
+# whole -- the full path, not just the last segment. Netskope returns
+# these as lists (a user is in many groups / OUs); the first entry is the
+# primary one, and joining or abbreviating them made the column wrong.
+MULTIVALUE_KEEP_FIRST: bool = True
+
+# Only used when MULTIVALUE_KEEP_FIRST is False.
 MAX_MULTIVALUE: int = 5
 MULTIVALUE_SEP: str = " | "
-SHORTEN_DN: bool = True
+SHORTEN_DN: bool = False
 
 # Any cell longer than this is truncated (0 = no limit). A safety net for
 # fields that turn out to be huge blobs.
@@ -512,13 +520,15 @@ DESIRED_COLUMNS: List[str] = [
 # Non-byte fields that also vary by name between event types/schemas.
 # Same mechanism as the byte aliases: the first name present in the data
 # wins and is copied onto the canonical name used in DESIRED_COLUMNS.
+# Kept deliberately tight. Loose aliases like "organization" or "ou" can
+# match a different field entirely and silently produce a wrong column --
+# the export's own names are usergroup and organization_unit, so those are
+# tried first and only near-identical spellings after.
 TEXT_FIELD_ALIASES: Dict[str, List[str]] = {
-    "usergroup": ["usergroup", "user_group", "usergroups", "user_groups",
-                  "groups", "group", "ad_group", "userGroup"],
-    "organization_unit": ["organization_unit", "org_unit", "orgunit", "ou",
-                          "organizationunit", "organization",
-                          "organizationUnit", "user_ou"],
-    "activity": ["activity", "action", "operation", "event_activity"],
+    "usergroup": ["usergroup", "user_group", "usergroups", "user_groups"],
+    "organization_unit": ["organization_unit", "organizationunit",
+                          "organization_units", "org_unit"],
+    "activity": ["activity", "action"],
 }
 
 BYTE_FIELD_ALIASES: Dict[str, List[str]] = {
@@ -550,6 +560,12 @@ PLACEHOLDER_COLUMNS: set = set()
 # columns are SUMMED across every event that collapses into that pair --
 # which is what makes them genuine "Sum -" figures.
 DEDUPE_ON: List[str] = ["user", "app"]
+
+# When rows collapse, these keep the FIRST row's value -- unless it is
+# blank, in which case the first non-blank value from a later duplicate is
+# used instead. Byte columns are summed rather than kept (see SUM_FIELDS).
+FILL_IF_BLANK: Tuple[str, ...] = ("organization_unit", "usergroup", "url",
+                                  "activity", "timestamp")
 
 # Epoch fields (like `timestamp`) are converted to readable dates on export.
 # Month/day/year: "%m/%d/%Y"           -> 07/23/2026
@@ -1379,6 +1395,16 @@ def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if field in row or field in kept:
                 kept[field] = to_number(kept.get(field)) + to_number(row.get(field))
 
+        # Non-summed fields keep the FIRST row's value -- but if that first
+        # value was blank, take it from a later duplicate rather than
+        # exporting an empty cell when the data was available all along.
+        for field in FILL_IF_BLANK:
+            if str(kept.get(field, "")).strip():
+                continue
+            candidate = str(row.get(field, "")).strip()
+            if candidate:
+                kept[field] = row[field]
+
     return unique
 
 
@@ -1457,6 +1483,13 @@ def tidy_multivalue(value: Any) -> Any:
         return value
 
     parts = [p.strip() for p in value.split(",") if p.strip()]
+    if not parts:
+        return value
+
+    # Primary value only, kept whole.
+    if MULTIVALUE_KEEP_FIRST:
+        return shorten_dn(parts[0]) if SHORTEN_DN else parts[0]
+
     if SHORTEN_DN:
         parts = [shorten_dn(p) for p in parts]
 
