@@ -1,6 +1,0 @@
-# Netskope GenAI Export dependencies
-requests>=2.28.0
-pandas>=1.5.0
-
-# Only needed when SHAREPOINT_ENABLED=true
-msal>=1.24.0
