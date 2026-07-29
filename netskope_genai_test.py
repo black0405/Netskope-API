@@ -1,325 +1,696 @@
 #!/usr/bin/env python3
 """
-Netskope GenAI Application Export -- standalone test version.
+Export Netskope GenAI page events to CSV.
 
-All configuration is in the CONFIGURATION block below; there is no
-config.env, no logging framework, and no screen wrapper. Edit the block,
-run the file, check the CSV.
+Endpoint : GET /api/v2/events/datasearch/page
+Docs     : Netskope REST API v2 - DataSearch
 
-    python netskope_genai_test.py                 # yesterday
-    python netskope_genai_test.py 2026-07-20      # a specific day
-    python netskope_genai_test.py --peek          # show raw field names only
+Per-event rows are fetched with offset paging inside time windows, then
+collapsed locally to one row per user+application with the byte columns
+summed. No server-side groupby is used.
 
-Dependencies: requests, pandas   (msal only if UPLOAD_TO_SHAREPOINT = True)
+Dependencies: requests, pandas (stdlib: typing, time, csv, json)
 """
 
 import csv
 import json
+import logging
 import os
+import shutil
+import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+import zipfile
+from logging.handlers import TimedRotatingFileHandler
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import requests
 
-# ===========================================================================
-# CONFIGURATION -- edit this block
-# ===========================================================================
-
-# --- Netskope --------------------------------------------------------------
-API_TOKEN: str = "PUT_YOUR_API_TOKEN_HERE"
-BASE_URL: str = "https://YOUR_TENANT.goskope.com"
-
-# "bearer"   -> Authorization: Bearer <token>
-# "netskope" -> Netskope-Api-Token: <token>
-# If you get 401s, try the other one.
-AUTH_MODE: str = "bearer"
-
-# WHICH EVENT TYPE -- this decides whether you get byte columns at all.
+# ---------------------------------------------------------------------------
+# CONFIG FILE LOADING
+# ---------------------------------------------------------------------------
+# All configuration lives in "config.env" next to this script, so the same
+# code can be promoted from UAT to production by swapping that one file --
+# no code edits, and no secrets in the .py.
 #
-#   page         Skope IT > Page Events.  HAS the traffic byte counts
-#                (Total Bytes / Bytes Uploaded / Bytes Downloaded).
-#                Netskope's own aggregation example uses this endpoint.
+# Precedence (highest first):
+#   1. real environment variables (what a scheduler or container injects)
+#   2. the config file
+#   3. the defaults in this file
+#
+# That order means UAT/PROD can override anything without touching the
+# config file, which is handy for CI or for keeping the secret in a vault.
+#
+# The path can be pointed elsewhere with the NETSKOPE_CONFIG_FILE
+# environment variable -- useful for running UAT and PROD side by side:
+#     NETSKOPE_CONFIG_FILE=/etc/netskope/prod.env python export_...py
+# ---------------------------------------------------------------------------
+
+# Filenames looked for, in order, in the script's own folder. The first one
+# that exists wins. ".env" stays in the list so older installs keep working.
+CONFIG_CANDIDATES: Tuple[str, ...] = (
+    "config.env",
+    "api_tokens.env",
+    "config.ini",
+    ".env",
+)
+
+
+def find_config_file() -> str:
+    """
+    Locate the config file: the NETSKOPE_CONFIG_FILE override if set,
+    otherwise the first CONFIG_CANDIDATES name found next to the script.
+    Returns the expected default path if none exist, so error messages can
+    still name a sensible file.
+    """
+    override = os.environ.get("NETSKOPE_CONFIG_FILE") or \
+        os.environ.get("NETSKOPE_ENV_FILE")          # legacy name
+    if override:
+        return override
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in CONFIG_CANDIDATES:
+        candidate = os.path.join(here, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return os.path.join(here, CONFIG_CANDIDATES[0])
+
+
+CONFIG_FILE = find_config_file()
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def anchored_path(value: str) -> str:
+    """
+    Resolve a configured folder to an absolute path.
+
+    Relative paths are anchored to the SCRIPT's folder, not the current
+    working directory. This matters because cron, systemd and Task
+    Scheduler all start the process somewhere unexpected (often the
+    filesystem root or the Windows system folder) -- an unanchored
+    "./output" would silently write to the wrong place. Absolute paths in
+    the config are used as-is.
+    """
+    if not value:
+        return SCRIPT_DIR
+    if os.path.isabs(value):
+        return value
+    return os.path.normpath(os.path.join(SCRIPT_DIR, value))
+
+
+
+
+def load_env_file(path: str) -> int:
+    """
+    Minimal KEY=value config parser -- no third-party dependency needed.
+
+    Handles  KEY=value , # comments, blank lines, optional surrounding
+    quotes, and 'export KEY=value'. Real environment variables already set
+    are never overwritten, so a scheduler can override the file.
+
+    Returns the number of values loaded.
+    """
+    loaded = 0
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                if line.lower().startswith("export "):
+                    line = line[7:].lstrip()
+
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip()
+
+                # Strip matching quotes, then any trailing inline comment
+                # on unquoted values.
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                elif " #" in value:
+                    value = value.split(" #", 1)[0].strip()
+
+                if key and key not in os.environ:
+                    os.environ[key] = value
+                    loaded += 1
+    except FileNotFoundError:
+        return 0
+    return loaded
+
+
+CONFIG_LOADED = load_env_file(CONFIG_FILE)
+
+
+def env_str(key: str, default: str = "") -> str:
+    """Read a text setting."""
+    value = os.environ.get(key)
+    return default if value is None or value == "" else value
+
+
+def env_bool(key: str, default: bool = False) -> bool:
+    """Read an on/off setting. Accepts true/yes/on/1 in any case."""
+    value = os.environ.get(key)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def env_int(key: str, default: int) -> int:
+    """Read a whole-number setting, falling back if it isn't a number."""
+    value = os.environ.get(key)
+    if value is None or value == "":
+        return default
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return default
+
+
+# ---------------------------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------------------------
+# One log file per calendar day (netskope_export.log, rotated at midnight
+# into netskope_export.log.YYYY-MM-DD). Because the file is per-day and
+# opened in append mode, running the job twice a day -- or ten times -- puts
+# every run in that day's file, each clearly delimited by a RUN START /
+# RUN END banner with its own run id.
+#
+# Retention: live logs older than LOG_RETENTION_DAYS are swept into a
+# monthly zip under logs/archive/, then deleted. Archives older than
+# ARCHIVE_RETENTION_DAYS are removed (0 = keep forever).
+# ---------------------------------------------------------------------------
+
+LOG_DIR: str = anchored_path(env_str("LOG_DIR", "./logs"))
+LOG_LEVEL: str = env_str("LOG_LEVEL", "INFO").upper()
+LOG_RETENTION_DAYS: int = env_int("LOG_RETENTION_DAYS", 20)
+ARCHIVE_RETENTION_DAYS: int = env_int("ARCHIVE_RETENTION_DAYS", 180)
+LOG_BASENAME: str = "netskope_export.log"
+
+log = logging.getLogger("netskope_export")
+
+
+class RunContext(logging.Filter):
+    """Stamps every record with the current run id."""
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__()
+        self.run_id = run_id
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.run_id = self.run_id
+        return True
+
+
+def setup_logging(run_id: str = "-") -> str:
+    """
+    Configure file + console logging. Returns the active log file path.
+
+    The file handler rotates at midnight so each day is its own file; the
+    console handler keeps interactive runs readable. Safe to call twice --
+    existing handlers are cleared first.
+    """
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, LOG_BASENAME)
+
+    log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    log.handlers.clear()
+    log.propagate = False
+
+    # Every line carries the run id, so two runs in one day stay readable.
+    file_format = logging.Formatter(
+        "%(asctime)s  %(levelname)-8s [%(run_id)s]  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = TimedRotatingFileHandler(
+        log_path, when="midnight", interval=1,
+        backupCount=LOG_RETENTION_DAYS + 5,   # archival does the real pruning
+        encoding="utf-8",
+    )
+    file_handler.suffix = "%Y-%m-%d"
+    file_handler.setFormatter(file_format)
+    log.addHandler(file_handler)
+
+    # Console: no timestamps, they're noise when you're watching it live.
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(console)
+
+    # Attach on the LOGGER, not the handlers: this guarantees run_id exists
+    # on every record, including ones emitted by helpers outside main().
+    # Without it the formatter raises KeyError: 'run_id'.
+    log.addFilter(RunContext(run_id))
+
+    return log_path
+
+
+def archive_old_logs() -> None:
+    """
+    Move rotated logs older than LOG_RETENTION_DAYS into a monthly zip in
+    logs/archive/, then delete the originals. Old zips are pruned per
+    ARCHIVE_RETENTION_DAYS.
+
+    Failures here are logged but never fatal -- housekeeping must not stop
+    the export.
+    """
+    try:
+        archive_dir = os.path.join(LOG_DIR, "archive")
+        cutoff = time.time() - (LOG_RETENTION_DAYS * ONE_DAY)
+
+        stale: List[str] = []
+        for name in os.listdir(LOG_DIR):
+            path = os.path.join(LOG_DIR, name)
+            # Only rotated files (basename.YYYY-MM-DD), never the live one.
+            if not os.path.isfile(path) or not name.startswith(LOG_BASENAME):
+                continue
+            if name == LOG_BASENAME:
+                continue
+            if os.path.getmtime(path) < cutoff:
+                stale.append(path)
+
+        if stale:
+            os.makedirs(archive_dir, exist_ok=True)
+            # Group into one zip per month so the folder stays tidy.
+            groups: Dict[str, List[str]] = {}
+            for path in stale:
+                month = time.strftime("%Y-%m", time.localtime(os.path.getmtime(path)))
+                groups.setdefault(month, []).append(path)
+
+            for month, paths in groups.items():
+                zip_path = os.path.join(archive_dir, f"logs_{month}.zip")
+                with zipfile.ZipFile(zip_path, "a", zipfile.ZIP_DEFLATED) as bundle:
+                    existing = set(bundle.namelist())
+                    for path in paths:
+                        name = os.path.basename(path)
+                        if name not in existing:
+                            bundle.write(path, name)
+                for path in paths:
+                    os.remove(path)
+                log.info("Archived %d log file(s) into %s",
+                         len(paths), os.path.basename(zip_path))
+
+        # Prune the archives themselves.
+        if ARCHIVE_RETENTION_DAYS > 0 and os.path.isdir(archive_dir):
+            zip_cutoff = time.time() - (ARCHIVE_RETENTION_DAYS * ONE_DAY)
+            for name in os.listdir(archive_dir):
+                path = os.path.join(archive_dir, name)
+                if name.endswith(".zip") and os.path.getmtime(path) < zip_cutoff:
+                    os.remove(path)
+                    log.info("Removed expired archive %s", name)
+
+    except Exception as exc:                      # housekeeping only
+        log.warning("Log archival skipped: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION  -- values come from .env; edit that file, not this one
+# ---------------------------------------------------------------------------
+
+# Your API token. Netskope issues these under Settings > Tools > REST API v2.
+API_TOKEN: str = env_str("NETSKOPE_API_TOKEN", "PUT_YOUR_API_TOKEN_HERE")
+
+# Tenant base URL, no trailing slash. e.g. "https://myorg.goskope.com"
+BASE_URL: str = env_str("NETSKOPE_BASE_URL", "https://YOUR_TENANT.goskope.com")
+
+# Endpoint path. Use the *datasearch* endpoints -- they are the ones built
+# on the Skope IT Query Language and accept the `query` filter and `fields`
+# column selection.
+#
+# WHICH EVENT TYPE MATTERS FOR THE BYTE COLUMNS:
+#   page         Skope IT > Page Events. Carries the traffic byte counts
+#                (Total / Uploaded / Downloaded). Use this one.
 #   application  Skope IT > Application Events. Activity detail (Login,
-#                Upload, Share, object names) but NO byte fields -- per
-#                Netskope's docs, "you can view activities of an app in
+#                Upload, Share, object names) but NO byte fields. Per
+#                Netskope's docs: "you can view activities of an app in
 #                application events and view bytes information in page
-#                events". This is why the byte columns came back empty.
+#                events."
+ENDPOINT_PATH: str = env_str("NETSKOPE_ENDPOINT_PATH",
+                             "/api/v2/events/datasearch/page")
+
+# Authentication style.
+#   "bearer"   -> Authorization: Bearer <token>        (requested / generic)
+#   "netskope" -> Netskope-Api-Token: <token>          (what Netskope expects)
+# If you get 401s with "bearer", flip this to "netskope".
+AUTH_MODE: str = env_str("NETSKOPE_AUTH_MODE", "bearer")
+
+# Output file. If DATE_STAMP_FILENAME is True the day being exported is
+# appended, e.g. GenerativeAI_Applications_2026-07-19.csv -- useful when a
+# folder of dated files is being picked up downstream.
+# Change the extension to .xlsx if you ever want Excel output instead; the
+# writer switches on the extension (that path needs the openpyxl package).
+OUTPUT_FILE: str = env_str("OUTPUT_FILE", "GenerativeAI_Applications.csv")
+
+# Folder the CSVs are written into. Created if missing.
+OUTPUT_DIR: str = anchored_path(env_str("OUTPUT_DIR", "./output"))
+DATE_STAMP_FILENAME: bool = env_bool("DATE_STAMP_FILENAME", True)
+
+# Worksheet name used only when OUTPUT_FILE has a .xlsx extension.
+# Excel limits: max 31 chars, and none of  : \ / ? * [ ]
+EXCEL_SHEET_NAME: str = env_str("EXCEL_SHEET_NAME", "in")
+
+# --- Which single day to pull ---------------------------------------------
+# DAY_MODE:
+#   "yesterday" -> the full previous calendar day, 00:00:00 to 23:59:59 local
+#   "today"     -> midnight local through right now
+#   "date"      -> the specific calendar day named in TARGET_DATE
+#   "rolling"   -> the trailing 24 hours from this moment
+DAY_MODE: str = env_str("DAY_MODE", "yesterday")
+TARGET_DATE: str = env_str("TARGET_DATE", "2026-07-19")
+
+# --- Unattended / scheduled runs -----------------------------------------
+# INTERACTIVE False skips the "which day?" prompt entirely and just uses
+# DAY_MODE, so the script can run from Task Scheduler / cron with no one at
+# the keyboard. Set True if you'd rather be asked each time.
+INTERACTIVE: bool = env_bool("INTERACTIVE", False)
+
+# A date can also be passed on the command line, which overrides DAY_MODE:
+#     python export_genai_applications.py              -> yesterday
+#     python export_genai_applications.py 2026-07-19   -> that specific day
 #
-# Use "page" for the byte report; "application" only if you want activity
-# and object detail instead.
-EVENT_TYPE: str = "page"
-ENDPOINT_PATH: str = f"/api/v2/events/datasearch/{EVENT_TYPE}"
+# Skip the run (exit 0) if the output file for that day already exists.
+# Keeps a re-run or an overlapping schedule from redoing finished work.
+SKIP_IF_EXISTS: bool = env_bool("SKIP_IF_EXISTS", True)
 
-# --- Filter ----------------------------------------------------------------
-# appcategory is the CCI *application* category. `category` is the web/URL
-# category and is a different taxonomy -- don't confuse them.
-FILTER_FIELD: str = "appcategory"
-FILTER_VALUE: str = "Generative AI"
-FILTER_OPERATOR: str = "in"          # in | equals
+# --- SharePoint upload ----------------------------------------------------
+# Set to False to only write the CSV locally and skip uploading.
+SHAREPOINT_ENABLED: bool = env_bool("SHAREPOINT_ENABLED", True)
 
-# --- Which day -------------------------------------------------------------
-# "yesterday" | "today" | "date"
-DAY_MODE: str = "yesterday"
-TARGET_DATE: str = "2026-07-20"      # only used when DAY_MODE = "date"
-
-# --- Output ----------------------------------------------------------------
-OUTPUT_DIR: str = "."                # "." = next to this script
-OUTPUT_FILE: str = "GenerativeAI_Applications.csv"
-DATE_STAMP_FILENAME: bool = True     # -> GenerativeAI_Applications_2026-07-20.csv
-
-DATE_FORMAT: str = "%m/%d/%Y"        # 07/29/2026
-MB_DECIMALS: int = 2
-
-# --- Multi-value fields (usergroup especially) ------------------------------
-# usergroup is a LIST -- a user can be in hundreds of AD groups, and each
-# value is a full DN that may itself contain commas, quotes and newlines.
-# Dumped raw into a CSV those newlines break the row structure, which is
-# what makes group text appear inside the byte columns.
+# Entra ID app registration (the SPN you had created).
+# SECURITY: prefer environment variables over hardcoding the secret. The
+# script reads these env vars first and only falls back to the constants
+# below if they're unset:
+#     SPN_TENANT_ID / SPN_CLIENT_ID / SPN_CLIENT_SECRET
+# These three come from the SPN (Entra ID app registration) your admin
+# created. They are static values you paste into the config file.
 #
-# Rows whose text fields are malformed are DROPPED, not repaired. A record
-# is dropped when a field contains an embedded newline / carriage return,
-# or is longer than MAX_FIELD_LENGTH -- both indicate the multi-value blob
-# that corrupts the CSV.
-# Only a genuine CSV-breaker (an embedded newline, or a list value) drops
-# a row. Length alone does NOT -- these OU and group paths are legitimately
-# long, and dropping on length silently discarded almost the whole export.
-DROP_MALFORMED_ROWS: bool = True
-
-# 0 disables the length check entirely. Set a number only if you want long
-# values gone as well.
-MAX_FIELD_LENGTH: int = 0
-
-# Which fields are checked for line breaks. Byte and date columns never are.
-CHECK_FIELDS: List[str] = ["user", "app", "url", "organization_unit"]
-
-# --- Behaviour -------------------------------------------------------------
-PAGE_SIZE: int = 5000                # Netskope caps at 10000
-TIME_WINDOW_SECONDS: int = 3600      # split the day; 0 = one flat query
-QUERY_TIMEOUT: int = 180             # server-side query timeout
-REQUEST_TIMEOUT: int = 60            # per-HTTP-request timeout
-MAX_RETRIES: int = 5
-DEBUG: bool = False                  # print every request/response
-
-# --- Pacing -----------------------------------------------------------------
-# Requests are made one at a time, in order. Concurrency was removed: it
-# adds load without helping in aggregate mode (which is a single query
-# anyway) and makes 5xx failures harder to attribute.
+# Not to be confused with the Graph ACCESS TOKEN, which the script fetches
+# at runtime by exchanging these three -- that one is short-lived and is
+# never configured anywhere.
 #
-# Seconds to wait between calls. 0 = no delay. A small gap is cheap
-# insurance against tripping rate limits on a long backfill.
-REQUEST_DELAY: float = 0.2
+# GRAPH_* names are still accepted for backwards compatibility.
+TENANT_ID: str = env_str("SPN_TENANT_ID",
+                         env_str("GRAPH_TENANT_ID", "PUT_TENANT_ID_HERE"))
+CLIENT_ID: str = env_str("SPN_CLIENT_ID",
+                         env_str("GRAPH_CLIENT_ID", "PUT_CLIENT_ID_HERE"))
+CLIENT_SECRET: str = env_str("SPN_CLIENT_SECRET",
+                             env_str("GRAPH_CLIENT_SECRET",
+                                     "PUT_CLIENT_SECRET_HERE"))
 
-# One row per user+application, byte columns summed. [] = every raw event.
-DEDUPE_ON: List[str] = ["user", "app"]
+# Where to put the file. Two ways to identify the site:
+#   A) leave SITE_ID blank and fill in the hostname + path, and the script
+#      resolves the ID for you (easier, costs one extra API call)
+#   B) paste a known SITE_ID and the hostname/path are ignored
+SITE_HOSTNAME: str = env_str("SHAREPOINT_SITE_HOSTNAME", "yourtenant.sharepoint.com")
+SITE_PATH: str = env_str("SHAREPOINT_SITE_PATH", "/sites/YourSiteName")
+SITE_ID: str = env_str("SHAREPOINT_SITE_ID", "")
 
-# --- How to get the byte totals --------------------------------------------
-# "aggregate" -- ask the API to group and sum server-side. This is how
-#                Netskope's own docs fetch traffic totals, and it is the
-#                only way that works if the raw events carry no byte
-#                fields (which is common for application events).
-# "raw"       -- pull per-event rows and sum them locally. Only works when
-#                the events actually contain byte fields.
-# "auto"      -- try aggregate; if it errors, fall back to raw.
-BYTE_MODE: str = "auto"
+# Document library ("drive"). Leave DRIVE_ID blank to look the library up by
+# name; "Documents" is the default library on most sites (it shows in the UI
+# as "Shared Documents").
+LIBRARY_NAME: str = env_str("SHAREPOINT_LIBRARY_NAME", "Documents")
+DRIVE_ID: str = env_str("SHAREPOINT_DRIVE_ID", "")
 
-# Fields to group by in aggregate mode.
+# Folder inside the library. "" uploads to the library root. Nested paths
+# are fine ("Reports/Netskope/GenAI"); missing folders are created.
+TARGET_FOLDER: str = env_str("SHAREPOINT_FOLDER", "Netskope/GenAI")
+
+# Overwrite a file of the same name if it's already up there.
+SHAREPOINT_REPLACE_EXISTING: bool = env_bool("SHAREPOINT_REPLACE_EXISTING", True)
+
+# One calendar day in seconds.
+ONE_DAY: int = 86400
+
+# Where the day ends.
+#   0 -> 00:00:00 yesterday through 00:00:00 today (a clean 86400s span)
+#   1 -> stops at 23:59:59 instead
+# Netskope treats endtime as INCLUSIVE, so with 0 an event landing exactly on
+# 00:00:00 appears in both this file and tomorrow's. Set to 1 if the
+# downstream consumer can't tolerate that duplicate.
+BOUNDARY_TRIM: int = 0
+
+# Records per page. Netskope caps this at 10000 for event data.
+PAGE_SIZE: int = env_int("PAGE_SIZE", 5000)
+
+# Offset pagination on this API becomes unreliable past roughly 10k records
+# in a single query (the backend re-sorts between pages, producing duplicates
+# and gaps). To stay correct we split the lookback into windows and paginate
+# inside each window. Set to 0 to disable windowing and use one flat query.
+TIME_WINDOW_SECONDS: int = env_int("TIME_WINDOW_SECONDS", 3600)
+
+# Network behaviour.
+REQUEST_TIMEOUT: int = 60      # seconds per HTTP request
+MAX_RETRIES: int = 5           # retries for 429 / 5xx / network errors
+BACKOFF_BASE: float = 2.0      # exponential backoff base, seconds
+
+# The datasearch endpoint takes its own server-side query timeout, in
+# seconds (Swagger marks it required, default 180). Raise it if large
+# windows start returning timeouts.
+QUERY_TIMEOUT: int = env_int("QUERY_TIMEOUT", 180)
+
+# Print the exact request (URL + params) and a snippet of every raw response
+# to the console. Turn this on FIRST if you're getting zero records -- it
+# will show you immediately whether the problem is auth, the filter, or the
+# response shape not matching what the script expects.
+DEBUG: bool = env_bool("DEBUG", False)
+
+# Name of the pagination query parameter. The datasearch endpoint documents
+# "offset" (number of rows to skip before presenting results). The older
+# /events/data/ endpoints used "skip" -- change this if you switch back.
+OFFSET_PARAM_NAME: str = "offset"
+
+# The mandatory filter.
+# IMPORTANT: the field is `appcategory` (the CCI *application* category,
+# e.g. 'Cloud Storage', 'Generative AI'), NOT `category` -- `category` is
+# the web/URL category and is a different taxonomy. The tenant's Swagger
+# page documents the filter example as:
+#     query=appcategory eq 'Cloud Storage' and app eq 'Microsoft Office'
+BASE_FILTER_FIELD: str = env_str("FILTER_FIELD", "appcategory")
+BASE_FILTER_VALUE: str = env_str("FILTER_VALUE", "Generative AI")
+BASE_FILTER_OPERATOR: str = env_str("FILTER_OPERATOR", "in")
+
+# Restrict and reorder the exported CSV to exactly these fields. Leave empty
+# to keep the default behaviour (every discovered field becomes a column).
+# A column listed here that never appears in the data is still exported,
+# blank, as required.
 #
-# IMPORTANT: an aggregated response contains ONLY these fields plus the
-# aggregates. Anything not listed here comes back blank, so every
-# descriptive column you want in the CSV has to be in this list.
-#
-# url and timestamp are deliberately NOT here: they vary per event, so
-# including them would explode the rollup into one row per URL per second
-# and defeat the point of a per-user-per-app total. They export blank in
-# aggregate mode -- see BYTE_MODE="raw" if you need them.
-# NOTE: usergroup is deliberately NOT here. It is multi-valued (hundreds of
-# AD groups per user), so grouping on it multiplies every user into one row
-# per group combination. It is fetched separately and attached afterwards.
-GROUP_BY: List[str] = ["user", "app", "organization_unit"]
-
-# Aggregate expressions: output name -> the sum() over the source field.
-# If a run errors with "unknown field", peek first and adjust the inner
-# names to whatever your tenant actually exposes.
-# Direction mapping for this tenant:
-#   ingress_client_bytes -> Bytes UPLOADED   (traffic into Netskope from
-#                                             the end-user client)
-#   ingress_server_bytes -> Bytes DOWNLOADED (the return leg)
-#   numbytes             -> Total Bytes
-#
-# The plain client_bytes / server_bytes fields also exist here. They are
-# kept as the fallback below, so if the ingress_* figures don't tie out
-# against Skope IT you can swap the two sets over without editing anything
-# else.
-AGGREGATIONS: Dict[str, str] = {
-    "numbytes":     "sum(numbytes)",
-    "client_bytes": "sum(ingress_client_bytes)",   # uploaded
-    "server_bytes": "sum(ingress_server_bytes)",   # downloaded
-}
-
-# Fallback aggregate expressions tried if the first set is rejected.
-AGGREGATION_FALLBACKS: List[Dict[str, str]] = [
-    # Plain (non-ingress) counters.
-    {
-        "numbytes":     "sum(numbytes)",
-        "client_bytes": "sum(client_bytes)",
-        "server_bytes": "sum(server_bytes)",
-    },
-    # The "_total" variants from Netskope's documented example.
-    {
-        "numbytes":     "sum(numbytes_total)",
-        "client_bytes": "sum(client_bytes_total)",
-        "server_bytes": "sum(server_bytes_total)",
-    },
+# BYTE FIELD NAMES -- read this before troubleshooting empty byte columns.
+# Netskope's own datasearch docs show the traffic totals as:
+#     numbytes        total bytes
+#     client_bytes    bytes sent BY the client   -> uploaded
+#     server_bytes    bytes sent BY the server   -> downloaded
+# Some tenants/schemas expose the "_total" variants instead. Rather than
+# guess, BYTE_FIELD_ALIASES below lists the candidates and the script uses
+# whichever actually appears in the data.
+DESIRED_COLUMNS: List[str] = [
+    "app",                 # Application
+    "user",                # User
+    "url",                 # URL
+    "timestamp",           # Event Date  (epoch -> DATE_FORMAT)
+    "usergroup",           # User Group
+    "organization_unit",   # Organization Unit
+    "numbytes",            # Sum - Total Bytes (MB)
+    "server_bytes",        # Sum - Bytes Downloaded (MB)
+    "client_bytes",        # Sum - Bytes Uploaded (MB)
 ]
 
-# --- SharePoint (off by default for local testing) --------------------------
-UPLOAD_TO_SHAREPOINT: bool = False
-SPN_TENANT_ID: str = ""
-SPN_CLIENT_ID: str = ""
-SPN_CLIENT_SECRET: str = ""
-SITE_HOSTNAME: str = "yourtenant.sharepoint.com"
-SITE_PATH: str = "/sites/YourSiteName"
-LIBRARY_NAME: str = "Documents"
-TARGET_FOLDER: str = "Netskope/GenAI"
-
-# ===========================================================================
-# COLUMNS
-# ===========================================================================
-
-# Field name -> CSV header, in output order.
-COLUMNS: List[Tuple[str, str]] = [
-    ("app",               "Application"),
-    ("user",              "User"),
-    ("url",               "URL"),
-    ("timestamp",         "Event Date"),
-    ("usergroup",         "User Group"),
-    ("organization_unit", "Organization Unit"),
-    ("numbytes",          "Sum - Total Bytes (MB)"),
-    ("server_bytes",      "Sum - Bytes Downloaded (MB)"),
-    ("client_bytes",      "Sum - Bytes Uploaded (MB)"),
-]
-
-# Leftmost row-counter column. Set ROW_NUMBER_HEADER = "" for a blank header.
-ADD_ROW_NUMBER: bool = True
-ROW_NUMBER_HEADER: str = "S.No."
-
-# Byte field names differ between Netskope schemas. The script asks for
-# every alias and uses whichever actually comes back.
-#   client_bytes = sent BY the client -> uploaded
-#   server_bytes = sent BY the server -> downloaded
-BYTE_ALIASES: Dict[str, List[str]] = {
+# Alternative names for the same measure, tried in order. The first one
+# present in the returned data wins, and its values are copied onto the
+# canonical name used in DESIRED_COLUMNS. This makes the export resilient
+# to the naming differences between Netskope schemas.
+# ingress_* are what this tenant exposes; the plain and _total names are
+# kept as fallbacks. First one present in the data wins.
+#   ingress_client_bytes -> UPLOADED   (traffic in from the end-user client)
+#   ingress_server_bytes -> DOWNLOADED (the return leg)
+BYTE_FIELD_ALIASES: Dict[str, List[str]] = {
     "numbytes":     ["numbytes", "numbytes_total", "total_bytes", "bytes"],
-    "server_bytes": ["server_bytes", "server_bytes_total",
-                     "ingress_server_bytes",
+    "server_bytes": ["ingress_server_bytes", "server_bytes",
+                     "server_bytes_total",
                      "bytes_downloaded", "download_bytes"],
-    "client_bytes": ["client_bytes", "client_bytes_total",
-                     "ingress_client_bytes",
+    "client_bytes": ["ingress_client_bytes", "client_bytes",
+                     "client_bytes_total",
                      "bytes_uploaded", "upload_bytes"],
 }
 
-SUM_FIELDS = set(BYTE_ALIASES)       # summed when rows collapse
-BYTES_FIELDS = set(BYTE_ALIASES)     # converted bytes -> MB
-EPOCH_FIELDS = {"timestamp"}         # epoch -> DATE_FORMAT
+# Columns in DESIRED_COLUMNS that do NOT exist in the API schema. They are
+# still written to the CSV (blank) but are never sent in the `fields`
+# parameter, since asking the API for an unknown field can fail the query.
+PLACEHOLDER_COLUMNS: set = set()
 
-ONE_DAY = 86400
+# Ask the API to return ONLY the fields we actually export, via the
+# datasearch `fields` parameter (e.g. fields=app,user). This cuts the
+# response from ~100 fields per row down to the handful you need.
+#
+# NOTE: because the byte field names vary by schema, the request asks for
+# every alias in BYTE_FIELD_ALIASES. Unknown field names are ignored by the
+# API rather than rejected. If your tenant errors on this, set to False and
+# the script will pull everything and pick the right columns locally.
+SEND_FIELDS_PARAM: bool = env_bool("SEND_FIELDS_PARAM", True)
 
-# ===========================================================================
-# Query building
-# ===========================================================================
+# Collapse the export to unique combinations of these fields. With
+# ["user", "app"] each user/application pair appears once, and the byte
+# columns are SUMMED across every event that collapses into that pair --
+# which is what makes them genuine "Sum -" figures.
+DEDUPE_ON: List[str] = ["user", "app"]
+
+# Epoch fields (like `timestamp`) are converted to readable dates on export.
+# Month/day/year: "%m/%d/%Y"           -> 07/23/2026
+# Day/month/year: "%d/%m/%Y"           -> 23/07/2026
+# Year first:     "%Y-%m-%d"           -> 2026-07-23
+# With time:      "%m/%d/%Y %H:%M:%S"  -> 07/23/2026 14:05:11
+# Times are rendered in the machine's LOCAL timezone, matching how the
+# day boundaries in resolve_day_range are calculated.
+DATE_FORMAT: str = env_str("DATE_FORMAT", "%m/%d/%Y")
+
+# Fields holding epoch seconds that should be formatted with DATE_FORMAT.
+EPOCH_FIELDS: set = {"timestamp", "_insertion_epoch_timestamp",
+                     "_creation_timestamp", "src_time"}
+
+# Numeric fields ADDED UP across rows collapsed by DEDUPE_ON, rather than
+# taking the first row's value. This is what turns per-event byte counts
+# into a per user+application total.
+SUM_FIELDS: set = {"numbytes", "server_bytes", "client_bytes", "file_size"}
+
+# Fields holding a byte count that should be converted to MB on export.
+BYTES_FIELDS: set = {"numbytes", "server_bytes", "client_bytes", "file_size"}
+
+# Decimal places for the MB conversion.
+MB_DECIMALS: int = env_int("MB_DECIMALS", 2)
+
+# Prepend a leftmost column holding a row counter, so the first data row
+# (spreadsheet row 2, since row 1 is the header) is numbered
+# ROW_NUMBER_START.
+ADD_ROW_NUMBER: bool = True
+ROW_NUMBER_START: int = 1
+
+# Header text for that column. Set to "" for a blank heading.
+ROW_NUMBER_HEADER: str = env_str("ROW_NUMBER_HEADER", "S.No.")
+
+# Rename the technical field names to the friendly headers you asked for.
+# Only applied to columns actually present in DESIRED_COLUMNS above.
+RENAME_COLUMNS: Dict[str, str] = {
+    "app": "Application",
+    "user": "User",
+    "url": "URL",
+    "timestamp": "Event Date",
+    "usergroup": "User Group",
+    "organization_unit": "Organization Unit",
+    "numbytes": "Sum - Total Bytes (MB)",
+    "server_bytes": "Sum - Bytes Downloaded (MB)",
+    "client_bytes": "Sum - Bytes Uploaded (MB)",
+    # kept in case they're re-added to DESIRED_COLUMNS
+    "activity": "Activity",
+    "object_type": "Object Type",
+    "object": "Object Name",
+    "file_size": "Sum - File Size (MB)",
+    "action": "Action",
+    "alert": "Alert",
+}
+
+# ---------------------------------------------------------------------------
+# FILTER SYNTAX
+# ---------------------------------------------------------------------------
+# Netskope Query Language (NQL) is passed as the `query` QUERY STRING
+# parameter -- this endpoint is a GET and takes no JSON body.
+#
+#   query=category eq 'generativeai' and appname eq 'ChatGPT'
+#
+# Terms are combined with `and` / `or`. If your tenant's dialect differs,
+# OPERATOR_MAP below is the only place you need to change.
+#
+# Each entry maps a friendly operator name to a template. {f} = field,
+# {v} = the quoted value.
+# ---------------------------------------------------------------------------
+
+OPERATOR_MAP: Dict[str, str] = {
+    "equals":      "{f} eq {v}",
+    "notequals":   "{f} ne {v}",
+    "contains":    "{f} like {v}",        # NQL `like` supports * wildcards
+    "startswith":  "{f} like {v}",        # value gets a trailing *
+    "endswith":    "{f} like {v}",        # value gets a leading *
+    "in":          "{f} in {v}",          # value = comma separated list
+    "greaterthan": "{f} gt {v}",
+    "lessthan":    "{f} lt {v}",
+}
+
+# Response keys that might hold the record array, in priority order.
+RESULT_KEYS: Tuple[str, ...] = ("result", "data", "events", "records", "items")
+
+# Response keys that might hold a pagination cursor / next pointer.
+CURSOR_KEYS: Tuple[str, ...] = (
+    "next", "nextUrl", "next_url", "next_token", "nextToken",
+    "cursor", "scroll_id", "wait_for_marker",
+)
+
+
+# ---------------------------------------------------------------------------
+# Filter construction
+# ---------------------------------------------------------------------------
+
+def quote_value(value: str) -> str:
+    """Single-quote a value for NQL, escaping any embedded quotes."""
+    return "'" + str(value).replace("'", "\\'") + "'"
+
+
+def build_term(field: str, operator: str, value: str) -> str:
+    """
+    Turn one (field, operator, value) triple into an NQL term.
+
+    Raises ValueError if the operator is not recognised.
+    """
+    key = operator.strip().lower().replace("_", "").replace(" ", "")
+    if key not in OPERATOR_MAP:
+        raise ValueError(
+            f"Unsupported operator '{operator}'. "
+            f"Supported: {', '.join(sorted(OPERATOR_MAP))}"
+        )
+
+    raw = str(value).strip()
+
+    # Wildcard shaping for the pattern-matching operators.
+    if key == "contains":
+        raw = f"*{raw}*"
+    elif key == "startswith":
+        raw = f"{raw}*"
+    elif key == "endswith":
+        raw = f"*{raw}"
+
+    if key == "in":
+        # Accepts either bare "a, b, c" or a pasted-in ['a', 'b'] / ["a","b"]
+        # form -- strip any wrapping brackets and per-item quotes first so
+        # the value never gets double-wrapped into something like
+        # in ['[\'a\']'], which matches nothing.
+        cleaned = raw.strip()
+        if cleaned.startswith("[") and cleaned.endswith("]"):
+            cleaned = cleaned[1:-1]
+        parts = []
+        for item in cleaned.split(","):
+            item = item.strip().strip("'").strip('"').strip()
+            if item:
+                parts.append(quote_value(item))
+        quoted = "[" + ", ".join(parts) + "]"
+    else:
+        quoted = quote_value(raw)
+
+    return OPERATOR_MAP[key].format(f=field.strip(), v=quoted)
 
 
 def build_query() -> str:
     """
-    Build the NQL filter, e.g.  appcategory in ['Generative AI']
-
-    Passed as the `query` query-string parameter -- this endpoint is a GET
-    and takes no JSON body.
+    Build the NQL query. The GenerativeAI application-category filter is
+    the only filter applied.
     """
-    value = str(FILTER_VALUE).replace("'", "\\'")
-    if FILTER_OPERATOR == "in":
-        return f"{FILTER_FIELD} in ['{value}']"
-    return f"{FILTER_FIELD} eq '{value}'"
+    return build_term(BASE_FILTER_FIELD, BASE_FILTER_OPERATOR, BASE_FILTER_VALUE)
 
 
-def fields_param() -> str:
-    """
-    Comma-separated `fields` list, so the API returns only what we export
-    instead of ~100 columns per row. Every byte alias is requested; unknown
-    names are ignored by the API.
-    """
-    wanted: List[str] = []
-    for field, _header in COLUMNS:
-        for name in BYTE_ALIASES.get(field, [field]):
-            if name not in wanted:
-                wanted.append(name)
-    return ",".join(wanted)
-
-
-# ===========================================================================
-# Day range
-# ===========================================================================
-
-
-def local_midnight(epoch: float) -> int:
-    """Snap a timestamp back to 00:00:00 that day, in LOCAL time."""
-    parts = list(time.localtime(epoch))
-    parts[3] = parts[4] = parts[5] = 0
-    parts[8] = -1                      # let mktime work out DST
-    return int(time.mktime(time.struct_time(parts)))
-
-
-def resolve_day() -> Tuple[int, int, str]:
-    """
-    Work out the day to export: a command-line date wins, then DAY_MODE.
-    Returns (start_epoch, end_epoch, label).
-    """
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    if args:
-        parsed = time.strptime(args[0], "%Y-%m-%d")
-        start = int(time.mktime(parsed))
-        return start, start + ONE_DAY, args[0]
-
-    now = time.time()
-    if DAY_MODE == "today":
-        start, end = local_midnight(now), int(now)
-    elif DAY_MODE == "date":
-        start = int(time.mktime(time.strptime(TARGET_DATE, "%Y-%m-%d")))
-        end = start + ONE_DAY
-    else:                                            # yesterday
-        start = local_midnight(now) - ONE_DAY
-        end = local_midnight(now)
-
-    return start, end, time.strftime("%Y-%m-%d", time.localtime(start))
-
-
-def output_path(label: str) -> str:
-    """Full path of the CSV for a given day."""
-    name = OUTPUT_FILE
-    if DATE_STAMP_FILENAME and "." in OUTPUT_FILE:
-        stem, _, ext = OUTPUT_FILE.rpartition(".")
-        name = f"{stem}_{label}.{ext}"
-
-    folder = OUTPUT_DIR
-    if not os.path.isabs(folder):
-        folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              folder)
-    os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, name)
-
-
-# ===========================================================================
-# API
-# ===========================================================================
-
-
-class ApiError(RuntimeError):
-    """Non-recoverable API problem."""
-
+# ---------------------------------------------------------------------------
+# HTTP layer
+# ---------------------------------------------------------------------------
 
 def build_session() -> requests.Session:
-    """Session with the auth header applied once."""
+    """Create a session with auth headers applied once."""
     session = requests.Session()
     if AUTH_MODE == "netskope":
         session.headers["Netskope-Api-Token"] = API_TOKEN
@@ -329,444 +700,545 @@ def build_session() -> requests.Session:
     return session
 
 
-def request_page(session: requests.Session, params: Dict[str, Any],
-                 stats: Dict[str, int]) -> Dict[str, Any]:
-    """One GET, with retry on 429 / 5xx / timeouts."""
-    url = BASE_URL.rstrip("/") + ENDPOINT_PATH
+class ApiError(RuntimeError):
+    """Raised for non-recoverable API problems."""
 
+
+def request_page(
+    session: requests.Session,
+    url: str,
+    params: Optional[Dict[str, Any]],
+    stats: Dict[str, int],
+) -> Dict[str, Any]:
+    """
+    Perform one GET with retry on 429, 5xx and transient network errors.
+
+    Returns the decoded JSON body. Raises ApiError on auth failure, bad
+    request, or exhausted retries.
+    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            if REQUEST_DELAY > 0 and stats.get("calls"):
-                time.sleep(REQUEST_DELAY)
-            stats["calls"] = stats.get("calls", 0) + 1
+            stats["calls"] += 1
             if DEBUG:
                 print(f"  [DEBUG] GET {url}")
-                print(f"  [DEBUG] params {params}")
+                print(f"  [DEBUG] params: {params}")
+                print(f"  [DEBUG] headers: {dict(session.headers)}")
             response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
             if DEBUG:
-                print(f"  [DEBUG] {response.status_code}: "
-                      f"{response.text[:400]}")
+                print(f"  [DEBUG] status: {response.status_code}")
+                print(f"  [DEBUG] body  : {response.text[:800]}")
 
-        except (requests.exceptions.Timeout,
-                requests.exceptions.ConnectionError) as exc:
-            wait = 2 ** attempt
-            print(f"  ! {type(exc).__name__} "
-                  f"(attempt {attempt}/{MAX_RETRIES}) -- retry in {wait}s")
+        except requests.exceptions.Timeout:
+            wait = BACKOFF_BASE ** attempt
+            log.warning("Netskope timeout after %ss (attempt %d/%d) -- retry in %.0fs",
+                        REQUEST_TIMEOUT, attempt, MAX_RETRIES, wait)
             time.sleep(wait)
             continue
 
+        except requests.exceptions.ConnectionError as exc:
+            wait = BACKOFF_BASE ** attempt
+            print(f"  ! Connection error: {exc} "
+                  f"(attempt {attempt}/{MAX_RETRIES}) -- retrying in {wait:.0f}s")
+            time.sleep(wait)
+            continue
+
+        # --- Rate limited -------------------------------------------------
         if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After", "")
-            wait = float(retry_after) if retry_after.isdigit() else 2 ** attempt
-            stats["throttled"] = stats.get("throttled", 0) + 1
-            print(f"\n  ! BLOCKED (HTTP 429 Too Many Requests) -- the API is "
-                  f"throttling us.")
-            print(f"    waiting {wait:.0f}s before retry "
-                  f"{attempt}/{MAX_RETRIES}"
-                  + (f" (Retry-After header said {retry_after}s)"
-                     if retry_after else ""))
-            if attempt == MAX_RETRIES:
-                raise ApiError(
-                    f"BLOCKED by rate limiting -- still getting 429 after "
-                    f"{MAX_RETRIES} attempts. Raise REQUEST_DELAY (currently "
-                    f"{REQUEST_DELAY}s) or run at a quieter time."
-                )
+            # Netskope returns remaining-quota headers; honour Retry-After
+            # when present, otherwise back off exponentially.
+            retry_after = response.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after and retry_after.isdigit() \
+                else BACKOFF_BASE ** attempt
+            log.warning("Netskope rate limited (429) -- sleeping %.0fs (attempt %d/%d)",
+                        wait, attempt, MAX_RETRIES)
             time.sleep(wait)
             continue
 
-        # ---- BLOCKED -----------------------------------------------------
-        if response.status_code == 401:
+        # --- Auth ---------------------------------------------------------
+        if response.status_code in (401, 403):
             raise ApiError(
-                "BLOCKED (HTTP 401 Unauthorized) -- the API rejected the "
-                "token.\n"
-                f"    Check API_TOKEN is correct and not expired, and try "
-                f"flipping AUTH_MODE (currently '{AUTH_MODE}' -- the other "
-                f"value is "
-                f"'{'netskope' if AUTH_MODE == 'bearer' else 'bearer'}').\n"
-                f"    Response: {response.text[:200]}"
+                f"Authentication failed (HTTP {response.status_code}). "
+                f"Check API_TOKEN, token scopes, and AUTH_MODE "
+                f"(currently '{AUTH_MODE}' -- try the other value). "
+                f"Body: {response.text[:300]}"
             )
 
-        if response.status_code == 403:
-            raise ApiError(
-                "BLOCKED (HTTP 403 Forbidden) -- the token is valid but not "
-                "permitted here.\n"
-                "    The REST API token needs read access to this endpoint. "
-                "In Netskope: Settings > Tools > REST API v2, check the "
-                "token's granted endpoints include "
-                f"{ENDPOINT_PATH}.\n"
-                f"    Response: {response.text[:200]}"
-            )
-
+        # --- Bad request: usually a malformed query --------------------
         if response.status_code == 400:
             raise ApiError(
-                f"HTTP 400 -- the API rejected the query. Usually a filter "
-                f"syntax or field-name problem. {response.text[:400]}"
+                f"HTTP 400 -- the API rejected the request. This is most often "
+                f"a filter syntax problem; check OPERATOR_MAP and your field "
+                f"name. Body: {response.text[:500]}"
             )
 
+        if response.status_code == 404:
+            raise ApiError(
+                f"HTTP 404 for {url} -- check BASE_URL and ENDPOINT_PATH."
+            )
+
+        # --- Server side --------------------------------------------------
         if response.status_code >= 500:
-            wait = 2 ** attempt
-            stats["server_errors"] = stats.get("server_errors", 0) + 1
-            print(f"\n  ! server error {response.status_code} "
-                  f"(attempt {attempt}/{MAX_RETRIES}) -- retry in {wait}s")
-            if DEBUG:
-                print(f"    body: {response.text[:300]}")
-            # A 500 on this API is often the query itself being too heavy:
-            # too wide a time window, too many groupby fields, or too large
-            # a limit. Surface that rather than just retrying blindly.
-            if attempt == MAX_RETRIES:
-                raise ApiError(
-                    f"HTTP {response.status_code} after {MAX_RETRIES} "
-                    f"attempts. On this endpoint a persistent 500 usually "
-                    f"means the query is too heavy -- try a smaller "
-                    f"PAGE_SIZE, a shorter TIME_WINDOW_SECONDS, or fewer "
-                    f"GROUP_BY fields. Body: {response.text[:200]}"
-                )
+            wait = BACKOFF_BASE ** attempt
+            print(f"  ! Server error {response.status_code} "
+                  f"(attempt {attempt}/{MAX_RETRIES}) -- retrying in {wait:.0f}s")
             time.sleep(wait)
             continue
 
         if not response.ok:
-            raise ApiError(f"HTTP {response.status_code}: "
-                           f"{response.text[:200]}")
+            raise ApiError(
+                f"Unexpected HTTP {response.status_code}: {response.text[:300]}"
+            )
 
+        # --- Success ------------------------------------------------------
         if not response.text.strip():
+            print("  ! Empty response body -- treating as no more data.")
             return {}
 
         try:
             return response.json()
         except json.JSONDecodeError:
-            raise ApiError(f"Response wasn't JSON: {response.text[:200]}")
+            raise ApiError(
+                f"Response was not valid JSON: {response.text[:300]}"
+            )
 
-    raise ApiError(f"Gave up after {MAX_RETRIES} retries")
-
-
-def progress(done: int, total: Optional[int], records: int, calls: int,
-             width: int = 30) -> None:
-    """
-    Single-line progress bar that overwrites itself.
-
-    total=None means the size isn't known up front (aggregate paging), so
-    a moving marker is shown instead of a percentage rather than faking one.
-    """
-    if total:
-        frac = min(done / total, 1.0)
-        filled = int(width * frac)
-        bar = "#" * filled + "-" * (width - filled)
-        head = f"[{bar}] {int(frac * 100):3d}%"
-    else:
-        pos = done % width
-        bar = "-" * pos + "#" + "-" * (width - pos - 1)
-        head = f"[{bar}]     "
-
-    print(f"\r  {head}  {records:>8,} records  {calls:>4} calls",
-          end="", flush=True)
+    raise ApiError(f"Giving up after {MAX_RETRIES} retries for {url}")
 
 
 def extract_records(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Pull the record list out, whatever key it's under."""
+    """
+    Pull the record list out of a response, whatever key it hides under.
+
+    If the payload is non-empty but none of RESULT_KEYS match, this is
+    almost always the reason "no data" happens with a healthy HTTP 200 --
+    the response shape doesn't match what we're looking for. Rather than
+    silently returning [], we scan every top-level value for the first
+    list we can find, and warn loudly either way so it's never a silent
+    failure.
+    """
     if not payload:
         return []
+
     if isinstance(payload, list):
         return payload
-    for key in ("result", "data", "events", "records", "items"):
+
+    for key in RESULT_KEYS:
         value = payload.get(key)
         if isinstance(value, list):
             return value
-    print(f"  [WARN] no record list in response; top-level keys: "
-          f"{list(payload.keys())}")
+
+    # Nothing matched the expected keys -- fall back to scanning for any
+    # list value anywhere in the payload before giving up.
+    for key, value in payload.items():
+        if isinstance(value, list):
+            print(f"  [WARN] Records found under unexpected key '{key}' "
+                  f"-- consider adding it to RESULT_KEYS.")
+            return value
+
+    print(f"  [WARN] Response had no recognizable record list. "
+          f"Top-level keys were: {list(payload.keys())}. "
+          f"If this looks like status/metadata only, the filter or auth "
+          f"is likely the issue -- check the DEBUG output above.")
     return []
 
 
-def fetch_aggregate(session: requests.Session, query: str,
-                    start: int, end: int, stats: Dict[str, int],
-                    aggregations: Dict[str, str]
-                    ) -> Optional[List[Dict[str, Any]]]:
+def extract_cursor(payload: Dict[str, Any]) -> Optional[str]:
+    """Look for a next-page pointer. Returns None if the API uses offsets."""
+    if not payload:
+        return None
+    for key in CURSOR_KEYS:
+        value = payload.get(key)
+        if value and isinstance(value, str):
+            return value
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pagination
+# ---------------------------------------------------------------------------
+
+def fields_param() -> Optional[str]:
     """
-    Ask the API to group and sum server-side.
-
-    Netskope's datasearch endpoint supports:
-        groupby=user,app
-        fields=numbytes=sum(numbytes),server_bytes=sum(server_bytes)
-
-    This returns one pre-summed row per group, which is both far faster
-    than pulling every event AND the only option when the raw events carry
-    no byte fields at all.
-
-    Returns None if the API rejects the aggregation (so the caller can fall
-    back to raw mode); raises for genuine failures like auth.
+    Comma-separated field list for the datasearch `fields` parameter, or
+    None to let the API return everything. Placeholder columns that don't
+    exist in the schema are excluded so they can't fail the query.
     """
-    field_expr = ",".join(f"{out}={expr}" for out, expr in aggregations.items())
+    if not SEND_FIELDS_PARAM or not DESIRED_COLUMNS:
+        return None
 
-    print(f"  groupby : {','.join(GROUP_BY)}")
-    print(f"  fields  : {field_expr}")
+    wanted: List[str] = []
+    for column in DESIRED_COLUMNS:
+        if column in PLACEHOLDER_COLUMNS:
+            continue
+        # Ask for every known alias of a byte field, since the exact name
+        # varies by schema. Unknown names are ignored by the API.
+        for name in BYTE_FIELD_ALIASES.get(column, [column]):
+            if name not in wanted:
+                wanted.append(name)
 
-    rows: List[Dict[str, Any]] = []
+    return ",".join(wanted) if wanted else None
+
+
+def resolve_byte_aliases(rows: List[Dict[str, Any]]) -> None:
+    """
+    Normalise byte-field naming, in place.
+
+    Whichever alias the tenant actually returned is copied onto the
+    canonical name used in DESIRED_COLUMNS, so the export doesn't care
+    whether the schema says `numbytes` or `numbytes_total`. Logs which
+    alias won, so an empty byte column is diagnosable at a glance.
+    """
+    if not rows:
+        return
+
+    present: set = set()
+    for row in rows[:50]:          # sampling is enough to spot the schema
+        present.update(row.keys())
+
+    for canonical, aliases in BYTE_FIELD_ALIASES.items():
+        if canonical in present:
+            continue               # already the right name
+
+        match = next((a for a in aliases if a in present), None)
+        if match:
+            log.info("byte field  %s -> using '%s'", canonical, match)
+            for row in rows:
+                if match in row:
+                    row[canonical] = row[match]
+        else:
+            log.warning("byte field  %s NOT FOUND (tried: %s) -- that column "
+                        "will export as 0", canonical, ", ".join(aliases))
+
+
+def render_progress(stats: Dict[str, int], bar_width: int = 28) -> None:
+    """
+    Draw a single-line, in-place progress bar (overwrites itself with \r
+    rather than scrolling the console with one line per page/window).
+
+    Suppressed when stdout isn't a terminal -- in a scheduled run the output
+    is usually redirected to a log file, and carriage-return animation turns
+    into thousands of unreadable lines there.
+    """
+    if not sys.stdout.isatty():
+        return
+
+    total = stats.get("total_windows", 1) or 1
+    done = stats.get("windows_done", 0)
+    frac = min(done / total, 1.0)
+    filled = int(bar_width * frac)
+    bar = "#" * filled + "-" * (bar_width - filled)
+    print(
+        f"\r  [{bar}] {int(frac * 100):3d}%  "
+        f"{stats.get('records', 0):>7} records  "
+        f"{stats.get('calls', 0):>4} calls",
+        end="",
+        flush=True,
+    )
+
+
+def fetch_window(
+    session: requests.Session,
+    query: str,
+    starttime: int,
+    endtime: int,
+    stats: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    """
+    Retrieve every record for one time window.
+
+    Prefers a server-supplied cursor if the response exposes one; otherwise
+    falls back to limit/offset paging, stopping on a short or empty page.
+    """
+    url = BASE_URL.rstrip("/") + ENDPOINT_PATH
+    records: List[Dict[str, Any]] = []
     offset = 0
-    pages = 0
+    next_url: Optional[str] = None
 
-    # Aggregated responses are paginated too. The first version fetched a
-    # single page and stopped, which silently truncated the export to
-    # whatever fitted in one response.
     while True:
-        params = {
-            "query": query,
-            "starttime": start,
-            "endtime": end,
-            "groupby": ",".join(GROUP_BY),
-            "fields": field_expr,
-            "limit": PAGE_SIZE,
-            "offset": offset,
-            "timeout": QUERY_TIMEOUT,
-        }
+        if next_url:
+            # Cursor mode: the API handed us a full URL or token.
+            target = next_url if next_url.startswith("http") else url
+            params = None if next_url.startswith("http") else {"cursor": next_url}
+        else:
+            target = url
+            params = {
+                "query": query,
+                "starttime": starttime,
+                "endtime": endtime,
+                "limit": PAGE_SIZE,
+                OFFSET_PARAM_NAME: offset,
+                "timeout": QUERY_TIMEOUT,
+            }
+            selected = fields_param()
+            if selected:
+                params["fields"] = selected
 
-        try:
-            page = extract_records(request_page(session, params, stats))
-        except ApiError as exc:
-            message = str(exc)
-            # A rejected aggregation is recoverable -- signal a fallback.
-            # Only treat the FIRST page that way; a failure mid-pagination
-            # is a real error and shouldn't silently return partial data.
-            if offset == 0 and ("400" in message or
-                                "unknown" in message.lower()):
-                print(f"  ! aggregation rejected: {message[:160]}")
-                return None
-            raise
+        payload = request_page(session, target, params, stats)
+
+        # Netskope wraps results with its own status block, e.g.
+        # {"result": [...], "status": {"execution": "SUCCESS", ...}}.
+        # A 200 HTTP response can still carry a query-level failure here
+        # (bad filter syntax, unknown field, etc.) -- surface it plainly.
+        status_block = payload.get("status") if isinstance(payload, dict) else None
+        if isinstance(status_block, dict) and status_block.get("execution") not in (None, "SUCCESS"):
+            print(f"  [WARN] API reported execution="
+                  f"{status_block.get('execution')!r}: "
+                  f"{status_block.get('message', '')}")
+
+        page = extract_records(payload)
 
         if not page:
             break
 
-        rows.extend(page)
-        pages += 1
-        progress(pages, None, len(rows), stats.get("calls", 0))
+        records.extend(page)
+        stats["records"] = stats.get("records", 0) + len(page)
+        render_progress(stats)
 
+        cursor = extract_cursor(payload)
+        if cursor:
+            next_url = cursor
+            continue
+
+        # Offset mode: a short page means we've reached the end.
         if len(page) < PAGE_SIZE:
             break
         offset += PAGE_SIZE
 
-    if rows:
-        print()
-    return rows
+    return records
 
 
-def fetch_all(session: requests.Session, query: str,
-              start: int, end: int, stats: Dict[str, int]
-              ) -> List[Dict[str, Any]]:
+def local_midnight(epoch: float) -> int:
     """
-    Pull every record for the day, one window at a time, in order.
+    Snap an epoch timestamp back to 00:00:00 of that day in LOCAL time.
 
-    The day is split into windows because offset pagination degrades past
-    ~10k rows in a single query (the backend re-sorts between pages,
-    producing duplicates and gaps). Windows are fetched sequentially --
-    simple, predictable, and easy to attribute when a call fails.
+    Netskope stores starttime/endtime as epoch seconds, so a "calendar day"
+    is defined by your machine's timezone. If you need UTC day boundaries
+    instead, swap time.localtime for time.gmtime and time.mktime for
+    calendar.timegm.
+    """
+    parts = list(time.localtime(epoch))
+    parts[3] = parts[4] = parts[5] = 0   # hour, minute, second
+    parts[8] = -1                        # let mktime work out DST
+    return int(time.mktime(time.struct_time(parts)))
 
-    Results are deduped on _id so any overlap can't double-count.
+
+def resolve_day_range() -> Tuple[int, int, str]:
+    """
+    Work out the single day to export.
+
+    Returns (starttime, endtime, label) where label is a YYYY-MM-DD string
+    used for the filename and console output.
+    """
+    now = time.time()
+
+    if DAY_MODE == "today":
+        start = local_midnight(now)
+        end = int(now)
+
+    elif DAY_MODE == "yesterday":
+        start = local_midnight(now) - ONE_DAY
+        end = local_midnight(now) - BOUNDARY_TRIM
+
+    elif DAY_MODE == "date":
+        # strptime gives us the naive date; mktime turns it into local epoch.
+        parsed = time.strptime(TARGET_DATE, "%Y-%m-%d")
+        start = int(time.mktime(parsed))
+        end = start + ONE_DAY - BOUNDARY_TRIM
+
+    elif DAY_MODE == "rolling":
+        end = int(now)
+        start = end - ONE_DAY
+
+    else:
+        raise ValueError(
+            f"DAY_MODE '{DAY_MODE}' is not valid. "
+            f"Use: yesterday, today, date, rolling"
+        )
+
+    label = time.strftime("%Y-%m-%d", time.localtime(start))
+    return start, end, label
+
+
+def prompt_for_date_range() -> Tuple[int, int, str]:
+    """
+    Work out which day to export, in this order of precedence:
+
+      1. A YYYY-MM-DD date passed on the command line
+      2. The interactive prompt, if INTERACTIVE is True
+      3. The DAY_MODE constant (default: yesterday)
+
+    Step 2 is skipped entirely for unattended runs, so a scheduled job never
+    blocks waiting on input that will never arrive.
+    """
+    # 1. Command line wins.
+    # First non-flag argument, if any, is treated as the date.
+    cli_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    cli_date = cli_args[0].strip() if cli_args else ""
+    if cli_date:
+        try:
+            parsed = time.strptime(cli_date, "%Y-%m-%d")
+        except ValueError:
+            print(f"'{cli_date}' isn't a valid date (expected YYYY-MM-DD).")
+            raise
+        start = int(time.mktime(parsed))
+        return start, start + ONE_DAY - BOUNDARY_TRIM, cli_date
+
+    # 2. No prompt on unattended runs.
+    if not INTERACTIVE:
+        return resolve_day_range()
+
+    print("\nWhich day to extract?")
+    print(f"  Press Enter to use the default ({DAY_MODE}).")
+    entry = input("  Start date (YYYY-MM-DD): ").strip()
+
+    if not entry:
+        return resolve_day_range()
+
+    try:
+        parsed = time.strptime(entry, "%Y-%m-%d")
+    except ValueError:
+        print(f"  '{entry}' isn't a valid date (expected YYYY-MM-DD). "
+              f"Falling back to the default.")
+        return resolve_day_range()
+
+    start = int(time.mktime(parsed))
+    end = start + ONE_DAY - BOUNDARY_TRIM
+    return start, end, entry
+
+
+def resolve_output_path(label: str) -> str:
+    """
+    Append the day being exported to the filename when configured, keeping
+    whatever extension OUTPUT_FILE uses (.xlsx, .csv, ...).
+    """
+    if DATE_STAMP_FILENAME and "." in OUTPUT_FILE:
+        stem, _, extension = OUTPUT_FILE.rpartition(".")
+        name = f"{stem}_{label}.{extension}"
+    elif DATE_STAMP_FILENAME:
+        name = f"{OUTPUT_FILE}_{label}"
+    else:
+        name = OUTPUT_FILE
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return os.path.join(OUTPUT_DIR, name)
+
+
+def fetch_all(
+    session: requests.Session,
+    query: str,
+    start: int,
+    now: int,
+    stats: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    """
+    Retrieve everything across the given day, subdividing into time windows
+    to keep offset pagination correct, and deduplicating by _id.
     """
     if TIME_WINDOW_SECONDS > 0:
-        bounds = list(range(start, end, TIME_WINDOW_SECONDS)) + [end]
+        bounds = list(range(start, now, TIME_WINDOW_SECONDS)) + [now]
         windows = list(zip(bounds[:-1], bounds[1:]))
     else:
-        windows = [(start, end)]
+        windows = [(start, now)]
 
-    print(f"  {len(windows)} window(s), sequential")
+    stats["total_windows"] = len(windows)
+    stats["windows_done"] = 0
+    stats.setdefault("records", 0)
 
     seen: set = set()
     all_records: List[Dict[str, Any]] = []
 
     for index, (w_start, w_end) in enumerate(windows, 1):
-        offset = 0
-        while True:
-            params = {
-                "query": query,
-                "starttime": w_start,
-                "endtime": w_end,
-                "limit": PAGE_SIZE,
-                "offset": offset,
-                "timeout": QUERY_TIMEOUT,
-                "fields": fields_param(),
-            }
-            page = extract_records(request_page(session, params, stats))
-            if not page:
-                break
+        for record in fetch_window(session, query, w_start, w_end, stats):
+            # _id is Netskope's per-event unique key. Fall back to the whole
+            # record if it's absent so we never drop legitimate rows.
+            key = record.get("_id") or json.dumps(record, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            all_records.append(record)
+        stats["windows_done"] = index
+        render_progress(stats)
 
-            for record in page:
-                key = record.get("_id") or json.dumps(record, sort_keys=True)
-                if key not in seen:
-                    seen.add(key)
-                    all_records.append(record)
-
-            if len(page) < PAGE_SIZE:
-                break
-            offset += PAGE_SIZE
-
-        progress(index, len(windows), len(all_records),
-                 stats.get("calls", 0))
-
-    print()
-    if stats.get("throttled"):
-        print(f"  note: rate limited {stats['throttled']} time(s) -- "
-              f"raise REQUEST_DELAY if this is frequent")
-    if stats.get("server_errors"):
-        print(f"  note: {stats['server_errors']} server error(s) were "
-              f"retried -- lower PAGE_SIZE or TIME_WINDOW_SECONDS if "
-              f"this persists")
-
+    if sys.stdout.isatty():
+        print()  # move off the progress bar line once the pull is complete
     return all_records
 
 
-# ===========================================================================
-# Shaping
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Flattening + column discovery
+# ---------------------------------------------------------------------------
 
+def flatten_record(
+    obj: Any,
+    prefix: str = "",
+    out: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Recursively flatten nested JSON into a single-level dict.
 
-def flatten(obj: Any, prefix: str = "",
-            out: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Flatten nested JSON to dotted keys; scalar lists become CSV strings."""
+      {"application": {"name": "ChatGPT"}}  ->  {"application.name": "ChatGPT"}
+
+    Lists of scalars become comma-separated strings. Lists of dicts are
+    expanded with an index so nothing is lost:  policies.0.name
+    """
     if out is None:
         out = {}
 
     if isinstance(obj, dict):
         for key, value in obj.items():
-            flatten(value, f"{prefix}.{key}" if prefix else str(key), out)
+            path = f"{prefix}.{key}" if prefix else str(key)
+            flatten_record(value, path, out)
+
     elif isinstance(obj, list):
         if not obj:
             out[prefix] = ""
-        elif all(not isinstance(i, (dict, list)) for i in obj):
+        elif all(not isinstance(item, (dict, list)) for item in obj):
+            # Scalars -> comma joined.
             out[prefix] = ", ".join("" if i is None else str(i) for i in obj)
         else:
             for i, item in enumerate(obj):
-                flatten(item, f"{prefix}.{i}", out)
+                flatten_record(item, f"{prefix}.{i}", out)
+
     else:
         out[prefix] = obj
 
     return out
 
 
-def resolve_byte_aliases(rows: List[Dict[str, Any]]) -> None:
+def discover_columns(rows: Iterable[Dict[str, Any]]) -> List[str]:
     """
-    Normalise byte-field naming in place.
-
-    Copies whichever alias the tenant returned onto the canonical name, so
-    the export doesn't care if the schema says numbytes or numbytes_total.
-    Reports what it found -- an empty byte column is then diagnosable.
+    Union of every key across every flattened record, in first-seen order.
+    No field names are hardcoded anywhere.
     """
-    if not rows:
-        return
-
-    present: set = set()
-    for row in rows[:50]:
-        present.update(row.keys())
-
-    for canonical, aliases in BYTE_ALIASES.items():
-        if canonical in present:
-            print(f"  byte field  {canonical}: found")
-            continue
-        match = next((a for a in aliases if a in present), None)
-        if match:
-            print(f"  byte field  {canonical}: using '{match}'")
-            for row in rows:
-                if match in row:
-                    row[canonical] = row[match]
-        else:
-            print(f"  byte field  {canonical}: NOT FOUND "
-                  f"(tried {', '.join(aliases)}) -- will export blank")
-
-
-def report_byte_health(rows: List[Dict[str, Any]]) -> None:
-    """
-    Say plainly whether the byte columns actually contain data.
-
-    An all-zero byte column is the single most confusing failure here --
-    it looks like a successful export. This turns it into an explicit
-    message with the next step.
-    """
-    if not rows:
-        return
-
-    all_zero = []
-    for field in BYTE_ALIASES:
-        total = sum(to_number(r.get(field)) for r in rows)
-        non_zero = sum(1 for r in rows if to_number(r.get(field)) > 0)
-        if total > 0:
-            print(f"  {field:<14} OK  -- {non_zero}/{len(rows)} rows, "
-                  f"{total / (1024 * 1024):,.1f} MB total")
-        else:
-            all_zero.append(field)
-
-    if all_zero:
-        print(f"\n  [!] These byte columns are ALL ZERO: "
-              f"{', '.join(all_zero)}")
-        print("      Most likely the raw events carry no byte fields at "
-              "all -- these totals only exist as aggregates.")
-        print("      Next step:  python netskope_genai_test.py --peek")
-        print("      Then set the inner names in AGGREGATIONS to whatever "
-              "numeric fields --peek shows.")
-
-
-def is_malformed(row: Dict[str, Any]) -> Optional[str]:
-    """
-    Decide whether a record should be dropped.
-
-    Returns the reason string if the row is malformed, else None.
-
-    The trigger is the multi-value blob (usergroup especially): those
-    values carry embedded newlines, which terminate a CSV row early and
-    shift every later field into the wrong column -- which is how group
-    text ends up inside the byte columns. Rather than repairing them, any
-    record containing one is discarded whole.
-    """
-    for field in CHECK_FIELDS:
-        value = row.get(field)
-        if value is None:
-            continue
-
-        # A list-valued field is the multi-value case by definition.
-        if isinstance(value, (list, tuple)):
-            return f"{field} is multi-valued ({len(value)} values)"
-
-        text = str(value)
-        if "\n" in text or "\r" in text:
-            return f"{field} contains a line break"
-        if MAX_FIELD_LENGTH and len(text) > MAX_FIELD_LENGTH:
-            return f"{field} is {len(text)} chars (limit {MAX_FIELD_LENGTH})"
-
-    return None
-
-
-def drop_malformed(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Filter out malformed records, reporting how many went and why.
-
-    Dropping is silent-failure-prone, so the counts are always printed --
-    a large drop count means the query is returning something unexpected
-    and is worth investigating rather than ignoring.
-    """
-    if not DROP_MALFORMED_ROWS:
-        return rows
-
-    kept: List[Dict[str, Any]] = []
-    reasons: Dict[str, int] = {}
-
+    columns: Dict[str, None] = {}
     for row in rows:
-        reason = is_malformed(row)
-        if reason:
-            reasons[reason] = reasons.get(reason, 0) + 1
-        else:
-            kept.append(row)
+        for key in row:
+            columns.setdefault(key, None)
+    return list(columns)
 
-    dropped = len(rows) - len(kept)
-    if dropped:
-        print(f"\n  dropped {dropped} of {len(rows)} row(s) as malformed:")
-        for reason, count in sorted(reasons.items(),
-                                    key=lambda kv: -kv[1])[:6]:
-            print(f"    {count:>6}  {reason}")
-        if dropped > len(rows) * 0.5:
-            print("    [!] over half the rows were dropped -- worth checking "
-                  "the query before trusting this export")
 
-    return kept
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+def dedupe_key(row: Dict[str, Any], fields: List[str]) -> Tuple[str, ...]:
+    """
+    Build a normalized comparison key so trivially-different spellings of
+    the same user/app collapse together. Real Netskope data routinely mixes
+    'User@Example.com' with 'user@example.com' and 'ChatGPT ' with
+    'ChatGPT', and a raw string compare would treat those as distinct rows.
+
+    Normalization: casefold, strip, and collapse internal whitespace runs.
+    """
+    key: List[str] = []
+    for field in fields:
+        value = row.get(field, "")
+        text = "" if value is None else str(value)
+        key.append(" ".join(text.split()).casefold())
+    return tuple(key)
 
 
 def to_number(value: Any) -> float:
-    """Numeric coercion; anything unparseable counts as 0."""
+    """Best-effort numeric coercion; anything unparseable counts as 0."""
     if value is None or value == "":
         return 0.0
     try:
@@ -775,436 +1247,936 @@ def to_number(value: Any) -> float:
         return 0.0
 
 
-def dedupe(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Collapse to one row per DEDUPE_ON combination, summing SUM_FIELDS.
+    Collapse rows to unique combinations of DEDUPE_ON, keeping the first
+    occurrence of each. Order is preserved. Rows missing a key field are
+    treated as having a blank value for it rather than being dropped.
 
-    Keys are casefolded and whitespace-collapsed so 'Alice@Corp.com' and
-    'alice@corp.com ' don't count as two different users.
+    Fields listed in SUM_FIELDS are accumulated across every row that
+    collapses into the same key, so the kept row carries the total for that
+    user/application pair rather than just its first event's value.
     """
     if not DEDUPE_ON:
         return rows
 
     index: Dict[Tuple[str, ...], Dict[str, Any]] = {}
     unique: List[Dict[str, Any]] = []
-
     for row in rows:
-        key = tuple(" ".join(str(row.get(f, "")).split()).casefold()
-                    for f in DEDUPE_ON)
+        key = dedupe_key(row, DEDUPE_ON)
         kept = index.get(key)
 
         if kept is None:
-            row = dict(row)
+            row = dict(row)   # don't mutate the caller's data
             for field in SUM_FIELDS:
                 if field in row:
-                    row[field] = to_number(row[field])
+                    row[field] = to_number(row.get(field))
             index[key] = row
             unique.append(row)
-        else:
-            for field in SUM_FIELDS:
-                if field in row or field in kept:
-                    kept[field] = to_number(kept.get(field)) + \
-                        to_number(row.get(field))
+            continue
+
+        # Duplicate: fold its summable values into the row we're keeping.
+        for field in SUM_FIELDS:
+            if field in row or field in kept:
+                kept[field] = to_number(kept.get(field)) + to_number(row.get(field))
 
     return unique
 
 
 def format_epoch(value: Any) -> Any:
-    """Epoch seconds -> DATE_FORMAT. Non-epoch values pass through."""
+    """
+    Convert an epoch-seconds value to a readable date using DATE_FORMAT.
+
+    Returns the original value untouched if it isn't a usable epoch --
+    blanks stay blank, and any field that already holds a formatted string
+    (some Netskope time fields do) passes through rather than being
+    mangled into a wrong date.
+    """
     if value is None or value == "":
         return ""
     try:
         epoch = float(value)
     except (TypeError, ValueError):
-        return value
+        return value          # already a string date, or something else
     if epoch <= 0:
         return ""
     try:
         return time.strftime(DATE_FORMAT, time.localtime(epoch))
     except (ValueError, OSError, OverflowError):
-        return value
+        return value          # out of range for the platform's localtime
 
 
 def bytes_to_mb(value: Any) -> Any:
-    """Byte count -> MB, rounded."""
+    """Convert a byte count to megabytes, rounded to MB_DECIMALS."""
     if value is None or value == "":
         return ""
     try:
         size = float(value)
     except (TypeError, ValueError):
         return value
-    return round(size / (1024 * 1024), MB_DECIMALS) if size > 0 else 0
+    if size <= 0:
+        return 0
+    return round(size / (1024 * 1024), MB_DECIMALS)
 
 
-def export_csv(rows: List[Dict[str, Any]], path: str) -> None:
-    """Write the CSV with exactly the configured columns and headers."""
-    fields = [f for f, _h in COLUMNS]
-    frame = pd.DataFrame(rows, columns=fields)
+def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> None:
+    """
+    Write to CSV with every discovered field as a column. Missing values are
+    written blank. QUOTE_MINIMAL keeps embedded commas safe. RENAME_COLUMNS,
+    if set, relabels headers for columns that are actually present.
+
+    Dedupe is applied HERE rather than at the call sites, so that every
+    export path (now and anything added later) is guaranteed to
+    get it. dedupe_rows is idempotent, so calling it twice is harmless.
+    """
+    rows = dedupe_rows(rows)
+    frame = pd.DataFrame(rows, columns=columns)
+    # Trim stray leading/trailing whitespace so the CSV doesn't carry the
+    # padding that some source fields arrive with.
+    for column in frame.columns:
+        if frame[column].dtype == object:
+            frame[column] = frame[column].apply(
+                lambda v: v.strip() if isinstance(v, str) else v
+            )
     frame = frame.where(pd.notnull(frame), "")
-
+    # Convert epoch fields to readable dates before headers get renamed.
     for column in frame.columns:
         if column in EPOCH_FIELDS:
             frame[column] = frame[column].apply(format_epoch)
         elif column in BYTES_FIELDS:
-            # Force numeric. If any non-numeric text ever reaches a byte
-            # column it becomes 0 rather than corrupting the column type.
             frame[column] = frame[column].apply(bytes_to_mb)
-        elif frame[column].dtype == object:
-            # Values are written as-is; malformed records were already
-            # dropped upstream rather than repaired here.
-            frame[column] = frame[column].apply(
-                lambda v: v.strip() if isinstance(v, str) else v)
 
-    frame = frame.rename(columns=dict(COLUMNS))
+    if RENAME_COLUMNS:
+        frame = frame.rename(columns=RENAME_COLUMNS)
 
+    # Unnamed leftmost counter column. Built as an explicit list (not a
+    # range) and re-assembled by column order rather than using insert(),
+    # so it behaves identically across pandas versions.
     if ADD_ROW_NUMBER:
-        frame[ROW_NUMBER_HEADER] = list(range(1, len(frame) + 1))
-        ordered = [ROW_NUMBER_HEADER] + [c for c in frame.columns
-                                         if c != ROW_NUMBER_HEADER]
+        numbers = [ROW_NUMBER_START + i for i in range(len(frame))]
+        frame = frame.copy()
+        frame[ROW_NUMBER_HEADER] = numbers
+        ordered = [ROW_NUMBER_HEADER] + [
+            c for c in frame.columns if c != ROW_NUMBER_HEADER
+        ]
         frame = frame[ordered]
 
-    # QUOTE_ALL rather than QUOTE_MINIMAL: these values contain commas,
-    # slashes and quotes by nature, and quoting everything removes any
-    # chance of a stray delimiter shifting columns.
-    frame.to_csv(path, index=False, quoting=csv.QUOTE_ALL,
-                 encoding="utf-8-sig")
+    if path.lower().endswith((".xlsx", ".xlsm")):
+        # index=False keeps the unnamed row-number column as the real
+        # first column rather than letting pandas write its own index.
+        frame.to_excel(
+            path,
+            sheet_name=EXCEL_SHEET_NAME,
+            index=False,
+            engine="openpyxl",
+        )
+    else:
+        frame.to_csv(path, index=False, quoting=csv.QUOTE_MINIMAL,
+                     encoding="utf-8")
 
 
-# ===========================================================================
-# Peek mode -- what does the data actually look like?
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Zero-result diagnostics
+# ---------------------------------------------------------------------------
 
-
-def peek(session: requests.Session, query: str, start: int, end: int,
-         stats: Dict[str, int]) -> None:
+def diagnose_zero_results(
+    session: requests.Session,
+    start: int,
+    end: int,
+    stats: Dict[str, int],
+) -> None:
     """
-    Pull a handful of unfiltered-by-fields records and print every key,
-    so you can confirm the real field names before trusting a full run.
-    """
-    print("\nPeek: 5 records, all fields (no `fields` restriction)\n")
-    params = {
-        "query": query,
-        "starttime": start,
-        "endtime": end,
-        "limit": 5,
-        "offset": 0,
-        "timeout": QUERY_TIMEOUT,
-    }
-    rows = [flatten(r) for r in extract_records(
-        request_page(session, params, stats))]
+    Runs automatically when the filtered pull comes back empty. Makes one
+    lightweight UNFILTERED call over the same day to answer two questions
+    without another round of manual DEBUG digging:
 
-    if not rows:
-        print("  No records returned for this filter/day.")
+      1. Is there any data at all for this day/tenant/token? If not, the
+         problem is auth, date range, or tenant-side -- not the filter.
+      2. What do the real field names and category-ish values look like?
+         A wrong filter field name or a category label that doesn't match
+         what's actually stored is the most common reason for 0 rows.
+    """
+    url = BASE_URL.rstrip("/") + ENDPOINT_PATH
+    params = {"starttime": start, "endtime": end, "limit": 5, OFFSET_PARAM_NAME: 0}
+
+    print("\nFilter matched nothing -- running one unfiltered check on the "
+          "same day to see what's actually there...")
+    try:
+        payload = request_page(session, url, params, stats)
+    except ApiError as exc:
+        print(f"  Unfiltered check also failed: {exc}")
         return
 
-    keys = sorted({k for row in rows for k in row})
-    print(f"  {len(rows)} record(s), {len(keys)} distinct fields:\n")
-    for key in keys:
-        sample = next((row[key] for row in rows
-                       if row.get(key) not in (None, "")), "")
-        print(f"    {key:<34} {str(sample)[:44]}")
+    sample = extract_records(payload)
+    if not sample:
+        print("  No records at all for this day, even without a filter. "
+              "That points to auth, the date range, or tenant retention -- "
+              "not the filter text. Try DEBUG = True and a wider date range.")
+        return
 
-    # Numeric fields are the candidates for sum() aggregation -- these are
-    # what the byte columns must be built from.
-    numeric = []
-    for key in keys:
-        values = [r.get(key) for r in rows if r.get(key) not in (None, "")]
-        if values and all(isinstance(v, (int, float)) and
-                          not isinstance(v, bool) for v in values):
-            numeric.append((key, values[0]))
+    flat_sample = [flatten_record(r) for r in sample]
+    cols = discover_columns(flat_sample)
+    shown = cols[:40]
+    print(f"  Data exists: found {len(sample)} unfiltered sample record(s).")
+    print(f"  Available fields: {', '.join(shown)}"
+          f"{' ...' if len(cols) > len(shown) else ''}")
 
-    print("\n  NUMERIC fields (candidates for sum() aggregation):")
-    if numeric:
-        for key, sample in numeric:
-            print(f"    {key:<34} e.g. {sample}")
-    else:
-        print("    (none) -- these events carry no numeric fields, so byte")
-        print("    totals are not available from this endpoint per-event.")
-
-    byteish = [k for k in keys
-               if any(t in k.lower() for t in ("byte", "size", "bytes"))]
-    print("\n  Byte-ish field names:")
-    print("   ", ", ".join(byteish) if byteish else "(none found)")
-
-    print("\n  Group-by candidates present:", ", ".join(
-        g for g in GROUP_BY if g in keys) or "(none)")
-
-
-# ===========================================================================
-# Probe -- find which byte fields this tenant actually supports
-# ===========================================================================
-
-
-def probe(session: requests.Session, query: str, start: int, end: int,
-          stats: Dict[str, int]) -> None:
-    """
-    Test candidate aggregate expressions one at a time against the live API
-    and report which work.
-
-    This exists because the raw field name and the aggregate output name
-    differ: Netskope's own example sums `client_bytes_total` but returns it
-    as `client_bytes`. A raw --peek therefore may not show the field even
-    when the aggregation works fine. The only reliable test is to ask.
-    """
-    candidates = [
-        "numbytes_total", "numbytes",
-        "client_bytes_total", "client_bytes",
-        "server_bytes_total", "server_bytes",
-        "bytes", "bytes_total",
-        "session_number_unique", "count",
-    ]
-
-    print(f"\nProbe: testing {len(candidates)} candidate field(s) on "
-          f"{ENDPOINT_PATH}")
-    print(f"  groupby = {','.join(GROUP_BY)}\n")
-
-    working: List[Tuple[str, Any]] = []
+    # Surface anything that looks like it could be the field(s) being
+    # filtered on, along with real sample values, so a wrong field name or
+    # wrong expected value is obvious at a glance.
+    candidates = [c for c in cols
+                  if any(term in c.lower() for term in ("categ", "org", "unit", "ou"))]
     for field in candidates:
-        params = {
-            "query": query,
-            "starttime": start,
-            "endtime": end,
-            "groupby": ",".join(GROUP_BY),
-            "fields": f"probe=sum({field})",
-            "limit": 1,
-            "offset": 0,
-            "timeout": QUERY_TIMEOUT,
-        }
-        try:
-            rows = extract_records(request_page(session, params, stats))
-        except ApiError as exc:
-            reason = str(exc)[:70].replace("\n", " ")
-            print(f"    {field:<24} REJECTED   {reason}")
-            continue
-
-        if not rows:
-            print(f"    {field:<24} accepted, but no rows returned")
-            continue
-
-        value = rows[0].get("probe")
-        marker = "OK" if value not in (None, "", 0) else "zero"
-        print(f"    {field:<24} {marker:<10} sample={value}")
-        if marker == "OK":
-            working.append((field, value))
-
-    print()
-    if working:
-        print("  Usable fields:")
-        for field, value in working:
-            print(f"    {field}  (e.g. {value})")
-        print("\n  Put the winners into AGGREGATIONS, e.g.")
-        print("    AGGREGATIONS = {")
-        for out, guess in (("numbytes", "numbytes"),
-                           ("server_bytes", "server_bytes"),
-                           ("client_bytes", "client_bytes")):
-            match = next((f for f, _v in working if f.startswith(guess)), None)
-            if match:
-                print(f'        "{out}": "sum({match})",')
-        print("    }")
-    else:
-        print("  No candidate returned usable data.")
-        print("  Either this event type carries no byte counts, or the")
-        print("  filter matched nothing for this day. Try widening the day")
-        print("  or running with FILTER_VALUE set to a busier category.")
+        values = sorted({str(row[field]) for row in flat_sample
+                          if row.get(field) not in (None, "")})
+        if values:
+            print(f"    {field} sample value(s): {', '.join(values[:5])}")
 
 
-# ===========================================================================
-# Main
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# SharePoint upload (Microsoft Graph)
+# ---------------------------------------------------------------------------
+# Uses the OAuth 2.0 client credentials flow -- no signed-in user, which is
+# what lets this run unattended. Requires the `msal` package:
+#     pip install msal
+#
+# The app registration needs Microsoft Graph APPLICATION permission
+# Sites.Selected, plus a site-level grant on the target site. Sites.Selected
+# alone grants nothing until that site grant is added.
+# ---------------------------------------------------------------------------
+
+GRAPH_ROOT: str = "https://graph.microsoft.com/v1.0"
+
+# Graph requires upload-session chunks to be a multiple of 320 KiB.
+CHUNK_SIZE: int = 320 * 1024 * 10          # 3.2 MB per chunk
+SIMPLE_UPLOAD_LIMIT: int = 4 * 1024 * 1024  # 4 MB: above this, use a session
 
 
-def main() -> int:
-    stats: Dict[str, int] = {"calls": 0}
-    started = time.time()
+class UploadError(RuntimeError):
+    """Raised when the SharePoint upload can't be completed."""
 
-    if "PUT_YOUR_API_TOKEN" in API_TOKEN or "YOUR_TENANT" in BASE_URL:
-        print("Set API_TOKEN and BASE_URL in the CONFIGURATION block first.")
-        return 1
 
-    query = build_query()
-    start, end, label = resolve_day()
+def graph_credentials() -> Tuple[str, str, str]:
+    """
+    Read credentials, preferring environment variables over the constants
+    so the secret needn't live in the file. Raises if anything is missing.
+    """
+    import os
 
-    print(f"\nDay      : {label}")
-    print(f"Query    : {query}")
-    print(f"Endpoint : {BASE_URL.rstrip('/')}{ENDPOINT_PATH}")
+    # SPN_* is the current name; GRAPH_* is accepted as a legacy alias so
+    # an older config file keeps working after the rename.
+    tenant = (os.environ.get("SPN_TENANT_ID")
+              or os.environ.get("GRAPH_TENANT_ID") or TENANT_ID)
+    client = (os.environ.get("SPN_CLIENT_ID")
+              or os.environ.get("GRAPH_CLIENT_ID") or CLIENT_ID)
+    secret = (os.environ.get("SPN_CLIENT_SECRET")
+              or os.environ.get("GRAPH_CLIENT_SECRET") or CLIENT_SECRET)
 
-    # The single most common cause of empty byte columns.
-    wants_bytes = any(f in BYTE_ALIASES for f, _h in COLUMNS)
-    if wants_bytes and EVENT_TYPE == "application":
-        print("\n  [!] EVENT_TYPE='application' but the export asks for byte")
-        print("      columns. Application Events carry activity detail, not")
-        print("      traffic bytes -- those live on Page Events. Set")
-        print("      EVENT_TYPE = 'page' or drop the byte columns.")
+    missing = [
+        name for name, value in
+        (("tenant id", tenant), ("client id", client), ("client secret", secret))
+        if not value or value.startswith("PUT_")
+    ]
+    if missing:
+        raise UploadError(
+            f"Missing SharePoint credential(s): {', '.join(missing)}. "
+            f"Set SPN_TENANT_ID / SPN_CLIENT_ID / SPN_CLIENT_SECRET in "
+            f"{os.path.basename(CONFIG_FILE)} (or as environment variables)."
+        )
+    return tenant, client, secret
 
-    session = build_session()
 
+def get_graph_token() -> str:
+    """Acquire an app-only Graph token via the client credentials flow."""
     try:
-        if "--peek" in sys.argv:
-            peek(session, query, start, end, stats)
-            return 0
+        import msal
+    except ImportError:
+        raise UploadError(
+            "The 'msal' package is required for the SharePoint upload. "
+            "Install it with:  pip install msal"
+        )
 
-        if "--probe" in sys.argv:
-            probe(session, query, start, end, stats)
-            return 0
+    tenant, client, secret = graph_credentials()
+    app = msal.ConfidentialClientApplication(
+        client_id=client,
+        client_credential=secret,
+        authority=f"https://login.microsoftonline.com/{tenant}",
+    )
 
-        records: List[Dict[str, Any]] = []
-        aggregated = False
+    # .default asks for whatever application permissions were consented.
+    result = app.acquire_token_for_client(
+        scopes=["https://graph.microsoft.com/.default"]
+    )
 
-        # --- Try server-side aggregation first --------------------------
-        if BYTE_MODE in ("aggregate", "auto"):
-            print("\nFetching (aggregated)...")
-            attempts = [AGGREGATIONS] + AGGREGATION_FALLBACKS
-            for attempt_no, aggregations in enumerate(attempts, 1):
-                if attempt_no > 1:
-                    print(f"  retrying with alternative field names "
-                          f"({attempt_no}/{len(attempts)})...")
-                result = fetch_aggregate(session, query, start, end,
-                                         stats, aggregations)
-                if result:
-                    records, aggregated = result, True
-                    break
+    if "access_token" not in result:
+        raise UploadError(
+            f"Token request failed: {result.get('error')} -- "
+            f"{result.get('error_description', '')[:300]}"
+        )
+    return result["access_token"]
 
-            if not aggregated and BYTE_MODE == "aggregate":
-                print("\nAggregation failed and BYTE_MODE='aggregate'. "
-                      "Run --peek to see the real field names, then adjust "
-                      "AGGREGATIONS.")
-                return 3
 
-        # --- Fall back to per-event rows --------------------------------
-        if not aggregated:
-            if BYTE_MODE == "auto":
-                print("\nFalling back to raw per-event fetch...")
-            else:
-                print("\nFetching...")
-            records = fetch_all(session, query, start, end, stats)
-    except ApiError as exc:
-        print(f"\nFAILED: {exc}")
-        return 2
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-        return 1
+def graph_get(session: requests.Session, url: str) -> Dict[str, Any]:
+    """GET a Graph endpoint and return the decoded JSON, or raise."""
+    response = session.get(url, timeout=REQUEST_TIMEOUT)
 
-    if not records:
-        print("\nNo records matched -- nothing written.")
-        print("Try --peek to see what the endpoint actually returns.")
-        return 3
+    # Both of these mean the same thing under Sites.Selected: the app
+    # authenticated fine but has no permission on THIS site. SharePoint
+    # reports it inconsistently -- sometimes a clean 403, sometimes a 401
+    # wrapped as "generalException / spException". Treat them together.
+    body = response.text or ""
+    is_site_grant_issue = (
+        response.status_code == 403
+        or (response.status_code == 401 and
+            ("spException" in body or "generalException" in body))
+    )
+    if is_site_grant_issue:
+        raise UploadError(
+            f"Graph returned {response.status_code} for {url}.\n"
+            f"  This is the classic Sites.Selected symptom: the app has the "
+            f"API permission but has NOT been granted access to this "
+            f"specific site.\n"
+            f"  The API permission alone grants nothing -- an admin must run "
+            f"the site-level grant once.\n"
+            f"  Run  python {sys.argv[0].rsplit('/', 1)[-1]} --grant-help  "
+            f"for the exact command."
+        )
+    if not response.ok:
+        raise UploadError(
+            f"Graph GET {url} failed ({response.status_code}): "
+            f"{response.text[:300]}"
+        )
+    return response.json()
 
-    rows = [flatten(r) for r in records]
-    raw_count = len(rows)
-    rows = drop_malformed(rows)
 
-    if not rows:
-        print("\nEvery row was dropped as malformed -- nothing written.")
-        return 3
+def print_grant_help() -> None:
+    """
+    Print the one-time site-permission grant an admin needs to run, with the
+    app's own IDs filled in. This is what fixes the 401/403 spException.
+    """
+    try:
+        _, client, _ = graph_credentials()
+    except UploadError:
+        client = CLIENT_ID
 
-    if aggregated:
-        # Already grouped and summed server-side -- summing again locally
-        # would be wrong, and the byte names already match what we asked for.
-        print(f"\n  aggregated server-side: {len(rows)} group(s)")
-        report_byte_health(rows)
-    else:
+    path = SITE_PATH if SITE_PATH.startswith("/") else "/" + SITE_PATH
+    print("=" * 70)
+    print("ONE-TIME SharePoint site grant (run by a SharePoint / Graph admin)")
+    print("=" * 70)
+    print()
+    print("Sites.Selected grants NO access until the app is granted rights on")
+    print("the specific site. Do that once with the two calls below.")
+    print()
+    print("STEP 1 -- get the site id (any admin token with Sites.Read.All):")
+    print(f"  GET {GRAPH_ROOT}/sites/{SITE_HOSTNAME}:{path}")
+    print("  -> copy the \"id\" from the response")
+    print()
+    print("STEP 2 -- grant this app WRITE on that site:")
+    print(f"  POST {GRAPH_ROOT}/sites/{{site-id}}/permissions")
+    print("  Content-Type: application/json")
+    print()
+    print("  {")
+    print('    "roles": ["write"],')
+    print('    "grantedToIdentities": [{')
+    print('      "application": {')
+    print(f'        "id": "{client}",')
+    print('        "displayName": "Netskope GenAI Export"')
+    print("      }")
+    print("    }]")
+    print("  }")
+    print()
+    print("Both steps can be run from Graph Explorer (aka.ms/ge) signed in as")
+    print("an admin, or via PowerShell (Get-MgSite / New-MgSitePermission).")
+    print("After the grant, re-run the export normally.")
+    print("=" * 70)
+
+
+def resolve_site_id(session: requests.Session) -> str:
+    """Look up the site's Graph ID from hostname + path, unless preset."""
+    if SITE_ID:
+        return SITE_ID
+    path = SITE_PATH if SITE_PATH.startswith("/") else "/" + SITE_PATH
+    url = f"{GRAPH_ROOT}/sites/{SITE_HOSTNAME}:{path}"
+    site = graph_get(session, url)
+    if "id" not in site:
+        raise UploadError(f"Could not resolve site id from {url}")
+    return site["id"]
+
+
+def resolve_drive_id(session: requests.Session, site_id: str) -> str:
+    """Find the document library ('drive') by name, unless preset."""
+    if DRIVE_ID:
+        return DRIVE_ID
+    payload = graph_get(session, f"{GRAPH_ROOT}/sites/{site_id}/drives")
+    drives = payload.get("value", [])
+    for drive in drives:
+        if drive.get("name", "").lower() == LIBRARY_NAME.lower():
+            return drive["id"]
+    available = ", ".join(d.get("name", "?") for d in drives) or "(none)"
+    raise UploadError(
+        f"No document library named '{LIBRARY_NAME}' on this site. "
+        f"Available: {available}"
+    )
+
+
+def remote_path(filename: str) -> str:
+    """Build the destination path inside the library."""
+    folder = TARGET_FOLDER.strip("/")
+    return f"{folder}/{filename}" if folder else filename
+
+
+def upload_small(session: requests.Session, drive_id: str,
+                 local_path: str, destination: str) -> Dict[str, Any]:
+    """Single PUT. Only valid for files under ~4 MB."""
+    url = (f"{GRAPH_ROOT}/drives/{drive_id}/root:/{destination}:/content"
+           f"?@microsoft.graph.conflictBehavior="
+           f"{'replace' if SHAREPOINT_REPLACE_EXISTING else 'fail'}")
+    with open(local_path, "rb") as handle:
+        response = session.put(url, data=handle, timeout=REQUEST_TIMEOUT)
+    if not response.ok:
+        raise UploadError(
+            f"Upload failed ({response.status_code}): {response.text[:300]}"
+        )
+    return response.json()
+
+
+def upload_large(session: requests.Session, drive_id: str,
+                 local_path: str, destination: str, size: int) -> Dict[str, Any]:
+    """
+    Chunked upload for files over the 4 MB simple-upload ceiling. Graph
+    hands back an upload URL, then each chunk is PUT with a Content-Range.
+    """
+    create_url = (f"{GRAPH_ROOT}/drives/{drive_id}/root:/{destination}:"
+                  f"/createUploadSession")
+    body = {
+        "item": {
+            "@microsoft.graph.conflictBehavior":
+                "replace" if SHAREPOINT_REPLACE_EXISTING else "fail"
+        }
+    }
+    response = session.post(create_url, json=body, timeout=REQUEST_TIMEOUT)
+    if not response.ok:
+        raise UploadError(
+            f"Could not start upload session ({response.status_code}): "
+            f"{response.text[:300]}"
+        )
+    upload_url = response.json().get("uploadUrl")
+    if not upload_url:
+        raise UploadError("Upload session response had no uploadUrl.")
+
+    sent = 0
+    with open(local_path, "rb") as handle:
+        while sent < size:
+            chunk = handle.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            last = sent + len(chunk) - 1
+            headers = {
+                "Content-Length": str(len(chunk)),
+                "Content-Range": f"bytes {sent}-{last}/{size}",
+            }
+            # NOTE: no auth header here on purpose -- the upload URL is
+            # pre-authorized, and sending one can cause a 401.
+            chunk_response = requests.put(
+                upload_url, data=chunk, headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if chunk_response.status_code not in (200, 201, 202):
+                raise UploadError(
+                    f"Chunk upload failed at byte {sent} "
+                    f"({chunk_response.status_code}): "
+                    f"{chunk_response.text[:300]}"
+                )
+            sent += len(chunk)
+            if sys.stdout.isatty():
+                percent = int(sent / size * 100)
+                print(f"\r  uploading... {percent:3d}%", end="", flush=True)
+
+    if sys.stdout.isatty():
         print()
-        resolve_byte_aliases(rows)
-        report_byte_health(rows)
-        rows = dedupe(rows)
-
-    path = output_path(label)
-    export_csv(rows, path)
-
-    print("\n" + "-" * 54)
-    print(f"Day exported     : {label}")
-    print(f"Records fetched  : {raw_count}")
-    if DEDUPE_ON:
-        print(f"Rows exported    : {len(rows)} "
-              f"(unique {'+'.join(DEDUPE_ON)})")
-    print(f"API calls        : {stats['calls']}")
-    print(f"Saved to         : {path}")
-    print(f"Elapsed          : {time.time() - started:.0f}s")
-    print("-" * 54)
-
-    if UPLOAD_TO_SHAREPOINT:
-        try:
-            print("\nUploading to SharePoint...")
-            print(f"  Uploaded: {upload_to_sharepoint(path)}")
-        except Exception as exc:
-            print(f"  UPLOAD FAILED: {exc}")
-            print(f"  CSV is still saved locally at {path}")
-            return 4
-
-    return 0
-
-
-# ===========================================================================
-# SharePoint upload (only used when UPLOAD_TO_SHAREPOINT = True)
-# ===========================================================================
+    return chunk_response.json() if chunk_response.content else {}
 
 
 def upload_to_sharepoint(local_path: str) -> str:
     """
-    Upload via Microsoft Graph using the client credentials flow.
-    Requires:  pip install msal
+    Upload a finished file to SharePoint. Returns the resulting web URL.
+    Picks the simple or chunked path based on file size.
+    """
+    size = 0
+    with open(local_path, "rb") as handle:
+        handle.seek(0, 2)
+        size = handle.tell()
 
-    The SPN needs Graph application permission Sites.Selected PLUS a
-    site-level grant on the target site -- the API permission alone grants
-    nothing, which shows up as a confusing 401/spException.
+    token = get_graph_token()
+    session = requests.Session()
+    session.headers["Authorization"] = f"Bearer {token}"
+    session.headers["Accept"] = "application/json"
+
+    site_id = resolve_site_id(session)
+    drive_id = resolve_drive_id(session, site_id)
+    destination = remote_path(local_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1])
+
+    if size <= SIMPLE_UPLOAD_LIMIT:
+        item = upload_small(session, drive_id, local_path, destination)
+    else:
+        item = upload_large(session, drive_id, local_path, destination, size)
+
+    return item.get("webUrl", "(uploaded)")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# TERMINAL MULTIPLEXER (screen / tmux)  -- Linux only
+# ---------------------------------------------------------------------------
+# On the FIRST, interactive run the script can relaunch itself inside a
+# named screen session ("Netskope GenAI") so a long extraction survives the
+# SSH connection dropping. You can detach with Ctrl-A D and reattach later
+# with:
+#     screen -r "Netskope GenAI"
+#
+# Three guards keep this from causing trouble:
+#
+#   1. NOT under a scheduler. If stdin/stdout isn't a terminal -- which is
+#      how cron and systemd run things -- the wrapper is skipped entirely.
+#      Without this you'd accumulate one orphaned session per scheduled
+#      run, and cron jobs would appear to "succeed" instantly while the
+#      real work happened invisibly elsewhere.
+#   2. NOT already inside one. STY/TMUX are set inside a session; the
+#      NETSKOPE_IN_SCREEN marker covers the relaunch itself. Together they
+#      make infinite re-spawning impossible.
+#   3. NOT if the binary is missing. RHEL 9 does not ship `screen` in the
+#      base repos (it moved to EPEL), so tmux is used as a fallback and a
+#      plain foreground run is the last resort.
+# ---------------------------------------------------------------------------
+
+SCREEN_ENABLED: bool = env_bool("USE_SCREEN", True)
+SCREEN_NAME: str = env_str("SCREEN_NAME", "Netskope GenAI")
+
+# "auto" tries screen then tmux; force one with "screen" or "tmux";
+# "none" disables the wrapper the same as USE_SCREEN=false.
+SCREEN_TOOL: str = env_str("SCREEN_TOOL", "auto").lower()
+
+# Guard variable set on the relaunched child.
+IN_SCREEN_MARKER: str = "NETSKOPE_IN_SCREEN"
+
+
+def running_interactively() -> bool:
+    """
+    True only when a human is at the terminal. cron, systemd, Task
+    Scheduler and CI all fail this check, which is exactly what we want --
+    the screen wrapper must never engage for a scheduled run.
     """
     try:
-        import msal
-    except ImportError:
-        raise RuntimeError("pip install msal")
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
 
-    if not (SPN_TENANT_ID and SPN_CLIENT_ID and SPN_CLIENT_SECRET):
-        raise RuntimeError("SPN_TENANT_ID / SPN_CLIENT_ID / "
-                           "SPN_CLIENT_SECRET are not set")
 
-    app = msal.ConfidentialClientApplication(
-        client_id=SPN_CLIENT_ID,
-        client_credential=SPN_CLIENT_SECRET,
-        authority=f"https://login.microsoftonline.com/{SPN_TENANT_ID}",
+def already_in_session() -> bool:
+    """True if we're inside screen/tmux, or are the relaunched child."""
+    return bool(
+        os.environ.get(IN_SCREEN_MARKER)
+        or os.environ.get("STY")       # set by screen
+        or os.environ.get("TMUX")      # set by tmux
     )
-    result = app.acquire_token_for_client(
-        scopes=["https://graph.microsoft.com/.default"])
-    if "access_token" not in result:
-        raise RuntimeError(f"token request failed: {result.get('error')} "
-                           f"{result.get('error_description', '')[:200]}")
 
-    graph = "https://graph.microsoft.com/v1.0"
-    session = requests.Session()
-    session.headers["Authorization"] = f"Bearer {result['access_token']}"
 
-    path = SITE_PATH if SITE_PATH.startswith("/") else "/" + SITE_PATH
-    site = session.get(f"{graph}/sites/{SITE_HOSTNAME}:{path}",
-                       timeout=REQUEST_TIMEOUT)
-    if not site.ok:
-        raise RuntimeError(
-            f"site lookup failed ({site.status_code}). With Sites.Selected "
-            f"this usually means the site-level grant is missing. "
-            f"{site.text[:200]}")
-    site_id = site.json()["id"]
+def pick_multiplexer() -> Optional[str]:
+    """Return the path to screen or tmux, honouring SCREEN_TOOL."""
+    if SCREEN_TOOL in ("none", "off", "false"):
+        return None
+    order = {
+        "screen": ["screen"],
+        "tmux": ["tmux"],
+    }.get(SCREEN_TOOL, ["screen", "tmux"])
+    for tool in order:
+        path = shutil.which(tool)
+        if path:
+            return path
+    return None
 
-    drives = session.get(f"{graph}/sites/{site_id}/drives",
-                         timeout=REQUEST_TIMEOUT).json().get("value", [])
-    drive = next((d for d in drives
-                  if d.get("name", "").lower() == LIBRARY_NAME.lower()), None)
-    if not drive:
-        raise RuntimeError(
-            f"no library named '{LIBRARY_NAME}'. Available: "
-            f"{', '.join(d.get('name', '?') for d in drives)}")
 
-    folder = TARGET_FOLDER.strip("/")
-    filename = os.path.basename(local_path)
-    destination = f"{folder}/{filename}" if folder else filename
+def relaunch_in_session() -> bool:
+    """
+    Re-run this script inside a named screen/tmux session and attach to it.
 
-    with open(local_path, "rb") as handle:
-        response = session.put(
-            f"{graph}/drives/{drive['id']}/root:/{destination}:/content"
-            f"?@microsoft.graph.conflictBehavior=replace",
-            data=handle, timeout=REQUEST_TIMEOUT)
-    if not response.ok:
-        raise RuntimeError(f"upload failed ({response.status_code}): "
-                           f"{response.text[:200]}")
-    return response.json().get("webUrl", "(uploaded)")
+    Returns True if the process was handed off (the caller should exit),
+    False if we should just carry on in the foreground.
+    """
+    if not SCREEN_ENABLED or os.name != "posix":
+        return False
+    if already_in_session() or not running_interactively():
+        return False
+
+    tool_path = pick_multiplexer()
+    if not tool_path:
+        print("Note: neither 'screen' nor 'tmux' found -- running in the "
+              "foreground.\n"
+              "      On RHEL 9:  sudo dnf install -y tmux\n"
+              "      (screen lives in EPEL:  sudo dnf install -y epel-release "
+              "screen)\n")
+        return False
+
+    tool = os.path.basename(tool_path)
+    python = sys.executable or "python3"
+    script = os.path.abspath(__file__)
+    args = [a for a in sys.argv[1:]]
+
+    child_env = dict(os.environ)
+    child_env[IN_SCREEN_MARKER] = "1"
+
+    if tool == "screen":
+        # -S names it, -m forces a new session even if one exists.
+        command = [tool_path, "-S", SCREEN_NAME, "-m", python, script] + args
+        reattach = f'screen -r "{SCREEN_NAME}"'
+        detach_keys = "Ctrl-A then D"
+    else:
+        command = [tool_path, "new-session", "-s", SCREEN_NAME,
+                   python, script] + args
+        reattach = f'tmux attach -t "{SCREEN_NAME}"'
+        detach_keys = "Ctrl-B then D"
+
+    print(f"Starting inside {tool} session: {SCREEN_NAME}")
+    print(f"  detach   : {detach_keys}")
+    print(f"  reattach : {reattach}")
+    print()
+
+    try:
+        completed = subprocess.run(command, env=child_env)
+        return True if completed.returncode is not None else False
+    except FileNotFoundError:
+        return False
+    except Exception as exc:
+        print(f"Could not start {tool} ({exc}) -- running in the foreground.")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# RUN STATUS (used by --check)
+# ---------------------------------------------------------------------------
+# Each export writes a small JSON status file recording what happened for
+# that day: whether the CSV was written, whether the upload succeeded, and
+# the row count. The later --check run reads these instead of re-querying
+# Netskope, so verifying costs nothing.
+# ---------------------------------------------------------------------------
+
+def status_path(label: str) -> str:
+    """Path of the status file for a given export day."""
+    folder = os.path.join(LOG_DIR, "status")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, f"run_{label}.json")
+
+
+def write_status(label: str, **fields: Any) -> None:
+    """
+    Record (or update) the outcome for a day. Merges with anything already
+    written, so a later upload retry can flip 'uploaded' to True without
+    losing the export details.
+    """
+    path = status_path(label)
+    data: Dict[str, Any] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (FileNotFoundError, ValueError):
+        pass
+
+    data.update(fields)
+    data["day"] = label
+    data["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+    except OSError as exc:
+        log.warning("Could not write status file %s: %s", path, exc)
+
+
+def read_status(label: str) -> Dict[str, Any]:
+    """Read a day's status file; empty dict if it doesn't exist."""
+    try:
+        with open(status_path(label), "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def run_check(run_id: str, started: float) -> int:
+    """
+    Verification pass -- does NOT re-export.
+
+    Looks at the day that should have been exported and reports whether it
+    actually was, and whether it reached SharePoint. If the CSV exists but
+    the upload failed earlier, the upload is retried here (that's the cheap
+    fix that makes a second daily run worth scheduling).
+
+    Exit codes match the main run so alerting logic stays identical.
+    """
+    log.info("MODE       check (verify only -- no extraction)")
+
+    try:
+        _, _, label = prompt_for_date_range()
+    except ValueError as exc:
+        log.error("CONFIG ERROR: bad date -- %s", exc)
+        return finish(1, started, run_id)
+
+    expected_csv = resolve_output_path(label)
+    status = read_status(label)
+    csv_exists = os.path.exists(expected_csv)
+
+    log.info("checking   %s", label)
+    log.info("expected   %s", expected_csv)
+
+    # --- Did the export happen at all? ------------------------------------
+    if not csv_exists:
+        log.error("CHECK FAILED: no export file for %s.", label)
+        if status:
+            log.error("  Last attempt at %s ended: %s",
+                      status.get("updated", "?"),
+                      status.get("result", "unknown"))
+            if status.get("error"):
+                log.error("  Reported error: %s", status["error"])
+        else:
+            log.error("  No run was recorded for this day at all -- the "
+                      "scheduled export did not fire, or died before it "
+                      "could log anything.")
+        log.error("  Backfill with:  python %s %s",
+                  os.path.basename(sys.argv[0]), label)
+        return finish(2, started, run_id)
+
+    rows = status.get("rows")
+    log.info("export     OK (%s rows)" % rows if rows is not None
+             else "export     OK")
+
+    # --- Did the upload happen? -------------------------------------------
+    if not SHAREPOINT_ENABLED:
+        log.info("upload     skipped (SHAREPOINT_ENABLED=false)")
+        log.info("CHECK PASSED for %s", label)
+        return finish(0, started, run_id)
+
+    if status.get("uploaded"):
+        log.info("upload     OK (%s)", status.get("upload_url", "previously uploaded"))
+        log.info("CHECK PASSED for %s", label)
+        return finish(0, started, run_id)
+
+    # CSV is on disk but never made it up -- retry now.
+    log.warning("upload     MISSING for %s -- retrying now.", label)
+    if status.get("error"):
+        log.warning("  Earlier failure was: %s", status["error"])
+
+    try:
+        web_url = upload_to_sharepoint(expected_csv)
+    except (UploadError, requests.exceptions.RequestException) as exc:
+        log.error("SHAREPOINT RETRY FAILED: %s", exc)
+        log.error("The CSV is still safe at %s", expected_csv)
+        write_status(label, result="upload_failed", error=str(exc)[:500])
+        return finish(4, started, run_id)
+
+    log.info("SHAREPOINT OK (on retry): %s", web_url)
+    write_status(label, uploaded=True, upload_url=web_url,
+                 result="success_after_retry", error="")
+    log.info("CHECK PASSED for %s (upload recovered)", label)
+    return finish(0, started, run_id)
+
+
+def main() -> int:
+    """
+    Returns a process exit code so a scheduler can detect failures:
+        0 = success (or nothing to do)
+        1 = configuration / input error
+        2 = NETSKOPE api or network failure
+        3 = ran fine but the filter matched no records
+        4 = data exported locally, but the SHAREPOINT upload failed
+
+    2 vs 4 is the distinction that matters operationally: 2 means no data
+    was collected, 4 means the data is on disk and only the upload needs
+    retrying.
+
+    Modes:
+        (no flag)   full export for the target day
+        --check     verify only; no extraction. Confirms the day's export
+                    and upload happened, and retries a failed upload.
+    """
+    stats: Dict[str, int] = {"calls": 0}
+    started = time.time()
+
+    # Run id ties every line of a run together, so two runs landing in the
+    # same day's log file stay easy to separate.
+    run_id = time.strftime("%H%M%S")
+    log_path = setup_logging(run_id)
+
+    log.info("=" * 64)
+    log.info("RUN START  %s", time.strftime("%Y-%m-%d %H:%M:%S"))
+    log.info("config     %s", CONFIG_FILE if CONFIG_LOADED
+             else f"{CONFIG_FILE} NOT FOUND -- using built-in defaults")
+    log.info("log file   %s", log_path)
+
+    archive_old_logs()
+
+    # Verification-only pass: no extraction, just confirm the day's export
+    # and upload actually happened (and retry the upload if it didn't).
+    if "--check" in sys.argv:
+        return run_check(run_id, started)
+
+    if "PUT_YOUR_API_TOKEN" in API_TOKEN or "YOUR_TENANT" in BASE_URL:
+        log.error("CONFIG ERROR: NETSKOPE_API_TOKEN / NETSKOPE_BASE_URL not "
+                  "set in %s", CONFIG_FILE)
+        return finish(1, started, run_id)
+
+    try:
+        query = build_query()
+    except ValueError as exc:
+        log.error("CONFIG ERROR: bad filter -- %s", exc)
+        return finish(1, started, run_id)
+
+    try:
+        start, end, label = prompt_for_date_range()
+    except ValueError as exc:
+        log.error("CONFIG ERROR: bad date -- %s", exc)
+        return finish(1, started, run_id)
+
+    output_path = resolve_output_path(label)
+
+    # Don't redo a day that's already been exported.
+    if SKIP_IF_EXISTS and os.path.exists(output_path):
+        log.info("SKIPPED: %s already exists -- nothing to do.", output_path)
+        return finish(0, started, run_id)
+
+    day_source = "cli" if [a for a in sys.argv[1:] if not a.startswith("-")] \
+        else DAY_MODE
+    log.info("day        %s (%s)", label, day_source)
+    log.info("query      %s", query)
+    log.info("endpoint   %s%s", BASE_URL.rstrip("/"), ENDPOINT_PATH)
+
+    session = build_session()
+
+    log.info("Fetching from Netskope...")
+    try:
+        records = fetch_all(session, query, start, end, stats)
+    except ApiError as exc:
+        log.error("NETSKOPE FAILED: %s", exc)
+        log.error("No data was collected. Nothing written, nothing uploaded.")
+        write_status(label, result="netskope_failed", error=str(exc)[:500],
+                     uploaded=False)
+        return finish(2, started, run_id)
+    except requests.exceptions.RequestException as exc:
+        log.error("NETSKOPE FAILED (network): %s", exc)
+        write_status(label, result="netskope_failed", error=str(exc)[:500],
+                     uploaded=False)
+        return finish(2, started, run_id)
+    except KeyboardInterrupt:
+        log.warning("Interrupted by user.")
+        return finish(1, started, run_id)
+
+    if not records:
+        log.warning("NETSKOPE returned no records for %s (%d API calls).",
+                    label, stats["calls"])
+        write_status(label, result="no_records", rows=0, uploaded=False)
+        try:
+            diagnose_zero_results(session, start, end, stats)
+        except Exception as exc:
+            log.warning("Zero-result diagnostic failed: %s", exc)
+        return finish(3, started, run_id)
+
+    flat_rows = [flatten_record(r) for r in records]
+    resolve_byte_aliases(flat_rows)
+    discovered = discover_columns(flat_rows)
+    raw_row_count = len(flat_rows)
+    flat_rows = dedupe_rows(flat_rows)
+
+    if DESIRED_COLUMNS:
+        missing = [c for c in DESIRED_COLUMNS if c not in discovered]
+        if missing:
+            log.warning("Requested columns absent from the data "
+                        "(exported blank): %s", ", ".join(missing))
+        columns = DESIRED_COLUMNS
+    else:
+        columns = discovered
+
+    try:
+        export_csv(flat_rows, columns, output_path)
+    except OSError as exc:
+        log.error("WRITE FAILED: could not write %s -- %s", output_path, exc)
+        return finish(1, started, run_id)
+
+    log.info("-" * 52)
+    log.info("Day exported            : %s", label)
+    log.info("Total records retrieved : %s", raw_row_count)
+    if DEDUPE_ON:
+        log.info("Unique rows exported    : %s (by %s)",
+                 len(flat_rows), "+".join(DEDUPE_ON))
+    log.info("Columns exported        : %s", len(columns))
+    log.info("API calls made          : %s", stats["calls"])
+    log.info("Exported to             : %s", output_path)
+    log.info("-" * 52)
+
+    write_status(label, result="exported", rows=len(flat_rows),
+                 csv=output_path, uploaded=False, error="")
+
+    # Upload happens after the local file is safely written, so a failure
+    # here never costs you the extracted data -- you can re-upload later.
+    if SHAREPOINT_ENABLED:
+        log.info("Uploading to SharePoint...")
+        try:
+            web_url = upload_to_sharepoint(output_path)
+            log.info("SHAREPOINT OK: %s", web_url)
+            write_status(label, result="success", uploaded=True,
+                         upload_url=web_url, error="")
+        except UploadError as exc:
+            log.error("SHAREPOINT FAILED: %s", exc)
+            log.error("The CSV is safe locally at %s -- the next --check run "
+                      "will retry the upload automatically.", output_path)
+            write_status(label, result="upload_failed", error=str(exc)[:500],
+                         uploaded=False)
+            return finish(4, started, run_id)
+        except requests.exceptions.RequestException as exc:
+            log.error("SHAREPOINT FAILED (network): %s", exc)
+            log.error("The CSV is safe locally at %s", output_path)
+            write_status(label, result="upload_failed", error=str(exc)[:500],
+                         uploaded=False)
+            return finish(4, started, run_id)
+    else:
+        log.info("SharePoint upload disabled (SHAREPOINT_ENABLED=false).")
+        write_status(label, result="exported_no_upload")
+
+    return finish(0, started, run_id)
+
+
+EXIT_MEANING: Dict[int, str] = {
+    0: "SUCCESS",
+    1: "CONFIG/INPUT ERROR",
+    2: "NETSKOPE FAILURE",
+    3: "NO RECORDS",
+    4: "SHAREPOINT UPLOAD FAILURE",
+}
+
+
+def finish(code: int, started: float, run_id: str) -> int:
+    """Write the closing banner. Every run ends with one line you can grep."""
+    elapsed = time.time() - started
+    level = logging.INFO if code == 0 else logging.ERROR
+    if code == 3:
+        level = logging.WARNING
+    log.log(level, "RUN END    status=%s exit=%d elapsed=%.0fs",
+            EXIT_MEANING.get(code, "UNKNOWN"), code, elapsed)
+    log.info("=" * 64)
+    logging.shutdown()
+    return code
 
 
 if __name__ == "__main__":
+    if "--grant-help" in sys.argv:
+        print_grant_help()
+        sys.exit(0)
+
+    # Interactive first run: hand off into a named screen/tmux session so
+    # the job survives a dropped SSH connection. Silently skipped under
+    # cron/systemd, and when --no-screen is passed.
+    if "--no-screen" not in sys.argv and relaunch_in_session():
+        sys.exit(0)
+
+    # Exit code lets Task Scheduler / cron flag a failed run.
     sys.exit(main())
