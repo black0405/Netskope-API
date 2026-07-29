@@ -17,9 +17,7 @@ import csv
 import json
 import os
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -104,25 +102,14 @@ REQUEST_TIMEOUT: int = 60            # per-HTTP-request timeout
 MAX_RETRIES: int = 5
 DEBUG: bool = False                  # print every request/response
 
-# --- Parallelism ------------------------------------------------------------
-# Time windows are fetched concurrently. More workers is faster but pushes
-# harder against the rate limit -- parallelism does NOT avoid throttling,
-# it reaches it sooner. RATE_LIMIT_PER_SEC is what actually keeps you under
-# the ceiling; MAX_WORKERS just decides how much work waits behind it.
+# --- Pacing -----------------------------------------------------------------
+# Requests are made one at a time, in order. Concurrency was removed: it
+# adds load without helping in aggregate mode (which is a single query
+# anyway) and makes 5xx failures harder to attribute.
 #
-# Netskope's documented limit for the events endpoints is on the order of a
-# few requests/second per tenant. Start conservative and raise it only if
-# you never see a 429.
-MAX_WORKERS: int = 4
-
-# Requests per second across ALL workers combined. 0 disables throttling.
-RATE_LIMIT_PER_SEC: float = 3.0
-
-# When any worker gets a 429, every worker pauses for this long. Backing off
-# globally is the point: if one thread is being throttled the others are
-# about to be too, and letting them keep hammering turns a brief slowdown
-# into a long one.
-RATE_LIMIT_COOLDOWN: float = 10.0
+# Seconds to wait between calls. 0 = no delay. A small gap is cheap
+# insurance against tripping rate limits on a long backfill.
+REQUEST_DELAY: float = 0.2
 
 # One row per user+application, byte columns summed. [] = every raw event.
 DEDUPE_ON: List[str] = ["user", "app"]
@@ -331,71 +318,6 @@ class ApiError(RuntimeError):
     """Non-recoverable API problem."""
 
 
-class Throttle:
-    """
-    Shared rate limiter for all worker threads.
-
-    Two mechanisms:
-
-      1. A minimum gap between requests, so the combined rate across every
-         worker stays at or below RATE_LIMIT_PER_SEC. This is what keeps
-         you under the limit -- concurrency alone would blow straight
-         through it.
-
-      2. A global cooldown gate. When any worker sees a 429 it sets a
-         "resume at" time and EVERY worker waits until then. Without this,
-         the other threads keep hammering an endpoint that has already said
-         no, which extends the throttling instead of clearing it.
-    """
-
-    def __init__(self, per_second: float, cooldown: float) -> None:
-        self._min_gap = 1.0 / per_second if per_second > 0 else 0.0
-        self._cooldown = cooldown
-        self._lock = threading.Lock()
-        self._next_slot = 0.0
-        self._resume_at = 0.0
-
-    def acquire(self) -> None:
-        """
-        Block until this thread may make a request.
-
-        Loops rather than computing a single wait: another thread can start
-        a cooldown while this one is sleeping, and the earlier version
-        returned without re-checking, which let workers sail straight
-        through a 429 pause.
-        """
-        while True:
-            with self._lock:
-                now = time.monotonic()
-
-                # Cooldown gate first -- it overrides the rate slot.
-                if now < self._resume_at:
-                    wait = self._resume_at - now
-                else:
-                    slot = max(now, self._next_slot)
-                    if slot <= now:
-                        # A slot is available right now; claim it.
-                        self._next_slot = now + self._min_gap
-                        return
-                    wait = slot - now
-
-            # Sleep in short bounces so a cooldown started by another
-            # thread is noticed promptly, then re-evaluate from scratch.
-            time.sleep(min(wait, 0.25))
-
-    def penalise(self, seconds: Optional[float] = None) -> None:
-        """Called on a 429 -- pauses every worker."""
-        with self._lock:
-            pause = seconds if seconds else self._cooldown
-            self._resume_at = max(self._resume_at,
-                                  time.monotonic() + pause)
-
-
-# Shared across threads; created in main().
-THROTTLE: Optional[Throttle] = None
-STATS_LOCK = threading.Lock()
-
-
 def build_session() -> requests.Session:
     """Session with the auth header applied once."""
     session = requests.Session()
@@ -414,10 +336,9 @@ def request_page(session: requests.Session, params: Dict[str, Any],
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            if THROTTLE:
-                THROTTLE.acquire()
-            with STATS_LOCK:
-                stats["calls"] = stats.get("calls", 0) + 1
+            if REQUEST_DELAY > 0 and stats.get("calls"):
+                time.sleep(REQUEST_DELAY)
+            stats["calls"] = stats.get("calls", 0) + 1
             if DEBUG:
                 print(f"  [DEBUG] GET {url}")
                 print(f"  [DEBUG] params {params}")
@@ -437,20 +358,43 @@ def request_page(session: requests.Session, params: Dict[str, Any],
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After", "")
             wait = float(retry_after) if retry_after.isdigit() else 2 ** attempt
-            # Pause EVERY worker, not just this one.
-            if THROTTLE:
-                THROTTLE.penalise(wait)
-            with STATS_LOCK:
-                stats["throttled"] = stats.get("throttled", 0) + 1
-            print(f"\n  ! rate limited (429) -- all workers pausing {wait:.0f}s")
+            stats["throttled"] = stats.get("throttled", 0) + 1
+            print(f"\n  ! BLOCKED (HTTP 429 Too Many Requests) -- the API is "
+                  f"throttling us.")
+            print(f"    waiting {wait:.0f}s before retry "
+                  f"{attempt}/{MAX_RETRIES}"
+                  + (f" (Retry-After header said {retry_after}s)"
+                     if retry_after else ""))
+            if attempt == MAX_RETRIES:
+                raise ApiError(
+                    f"BLOCKED by rate limiting -- still getting 429 after "
+                    f"{MAX_RETRIES} attempts. Raise REQUEST_DELAY (currently "
+                    f"{REQUEST_DELAY}s) or run at a quieter time."
+                )
             time.sleep(wait)
             continue
 
-        if response.status_code in (401, 403):
+        # ---- BLOCKED -----------------------------------------------------
+        if response.status_code == 401:
             raise ApiError(
-                f"Auth failed (HTTP {response.status_code}). Check API_TOKEN, "
-                f"and try flipping AUTH_MODE (currently '{AUTH_MODE}'). "
-                f"{response.text[:200]}"
+                "BLOCKED (HTTP 401 Unauthorized) -- the API rejected the "
+                "token.\n"
+                f"    Check API_TOKEN is correct and not expired, and try "
+                f"flipping AUTH_MODE (currently '{AUTH_MODE}' -- the other "
+                f"value is "
+                f"'{'netskope' if AUTH_MODE == 'bearer' else 'bearer'}').\n"
+                f"    Response: {response.text[:200]}"
+            )
+
+        if response.status_code == 403:
+            raise ApiError(
+                "BLOCKED (HTTP 403 Forbidden) -- the token is valid but not "
+                "permitted here.\n"
+                "    The REST API token needs read access to this endpoint. "
+                "In Netskope: Settings > Tools > REST API v2, check the "
+                "token's granted endpoints include "
+                f"{ENDPOINT_PATH}.\n"
+                f"    Response: {response.text[:200]}"
             )
 
         if response.status_code == 400:
@@ -461,7 +405,22 @@ def request_page(session: requests.Session, params: Dict[str, Any],
 
         if response.status_code >= 500:
             wait = 2 ** attempt
-            print(f"  ! server error {response.status_code} -- retry in {wait}s")
+            stats["server_errors"] = stats.get("server_errors", 0) + 1
+            print(f"\n  ! server error {response.status_code} "
+                  f"(attempt {attempt}/{MAX_RETRIES}) -- retry in {wait}s")
+            if DEBUG:
+                print(f"    body: {response.text[:300]}")
+            # A 500 on this API is often the query itself being too heavy:
+            # too wide a time window, too many groupby fields, or too large
+            # a limit. Surface that rather than just retrying blindly.
+            if attempt == MAX_RETRIES:
+                raise ApiError(
+                    f"HTTP {response.status_code} after {MAX_RETRIES} "
+                    f"attempts. On this endpoint a persistent 500 usually "
+                    f"means the query is too heavy -- try a smaller "
+                    f"PAGE_SIZE, a shorter TIME_WINDOW_SECONDS, or fewer "
+                    f"GROUP_BY fields. Body: {response.text[:200]}"
+                )
             time.sleep(wait)
             continue
 
@@ -478,6 +437,28 @@ def request_page(session: requests.Session, params: Dict[str, Any],
             raise ApiError(f"Response wasn't JSON: {response.text[:200]}")
 
     raise ApiError(f"Gave up after {MAX_RETRIES} retries")
+
+
+def progress(done: int, total: Optional[int], records: int, calls: int,
+             width: int = 30) -> None:
+    """
+    Single-line progress bar that overwrites itself.
+
+    total=None means the size isn't known up front (aggregate paging), so
+    a moving marker is shown instead of a percentage rather than faking one.
+    """
+    if total:
+        frac = min(done / total, 1.0)
+        filled = int(width * frac)
+        bar = "#" * filled + "-" * (width - filled)
+        head = f"[{bar}] {int(frac * 100):3d}%"
+    else:
+        pos = done % width
+        bar = "-" * pos + "#" + "-" * (width - pos - 1)
+        head = f"[{bar}]     "
+
+    print(f"\r  {head}  {records:>8,} records  {calls:>4} calls",
+          end="", flush=True)
 
 
 def extract_records(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -520,6 +501,7 @@ def fetch_aggregate(session: requests.Session, query: str,
 
     rows: List[Dict[str, Any]] = []
     offset = 0
+    pages = 0
 
     # Aggregated responses are paginated too. The first version fetched a
     # single page and stopped, which silently truncated the export to
@@ -553,7 +535,8 @@ def fetch_aggregate(session: requests.Session, query: str,
             break
 
         rows.extend(page)
-        print(f"\r  fetched {len(rows):>7} group(s)", end="", flush=True)
+        pages += 1
+        progress(pages, None, len(rows), stats.get("calls", 0))
 
         if len(page) < PAGE_SIZE:
             break
@@ -564,56 +547,18 @@ def fetch_aggregate(session: requests.Session, query: str,
     return rows
 
 
-def fetch_window(session: requests.Session, query: str,
-                 w_start: int, w_end: int,
-                 stats: Dict[str, int]) -> List[Dict[str, Any]]:
-    """
-    Fetch every page for ONE time window. Runs on a worker thread.
-
-    Paging stays sequential within a window because each offset depends on
-    the previous page's size -- only the windows themselves parallelise.
-    """
-    records: List[Dict[str, Any]] = []
-    offset = 0
-
-    while True:
-        params = {
-            "query": query,
-            "starttime": w_start,
-            "endtime": w_end,
-            "limit": PAGE_SIZE,
-            "offset": offset,
-            "timeout": QUERY_TIMEOUT,
-            "fields": fields_param(),
-        }
-        page = extract_records(request_page(session, params, stats))
-        if not page:
-            break
-
-        records.extend(page)
-        if len(page) < PAGE_SIZE:
-            break
-        offset += PAGE_SIZE
-
-    return records
-
-
 def fetch_all(session: requests.Session, query: str,
               start: int, end: int, stats: Dict[str, int]
               ) -> List[Dict[str, Any]]:
     """
-    Pull every record for the day, fetching time windows in parallel.
+    Pull every record for the day, one window at a time, in order.
 
     The day is split into windows because offset pagination degrades past
-    ~10k rows in one query (the backend re-sorts between pages, producing
-    duplicates and gaps). Those windows are independent, which is exactly
-    what makes them safe to run concurrently.
+    ~10k rows in a single query (the backend re-sorts between pages,
+    producing duplicates and gaps). Windows are fetched sequentially --
+    simple, predictable, and easy to attribute when a call fails.
 
-    Throughput is governed by the shared Throttle, not by MAX_WORKERS --
-    adding workers without raising RATE_LIMIT_PER_SEC just adds queueing.
-
-    Results are deduped on _id, so an overlap between windows can't
-    double-count.
+    Results are deduped on _id so any overlap can't double-count.
     """
     if TIME_WINDOW_SECONDS > 0:
         bounds = list(range(start, end, TIME_WINDOW_SECONDS)) + [end]
@@ -621,53 +566,48 @@ def fetch_all(session: requests.Session, query: str,
     else:
         windows = [(start, end)]
 
-    workers = max(1, min(MAX_WORKERS, len(windows)))
-    print(f"  {len(windows)} window(s), {workers} worker(s), "
-          f"{RATE_LIMIT_PER_SEC}/s limit")
+    print(f"  {len(windows)} window(s), sequential")
 
     seen: set = set()
     all_records: List[Dict[str, Any]] = []
-    done = 0
 
-    # A Session isn't guaranteed thread-safe, so each worker gets its own.
-    local = threading.local()
+    for index, (w_start, w_end) in enumerate(windows, 1):
+        offset = 0
+        while True:
+            params = {
+                "query": query,
+                "starttime": w_start,
+                "endtime": w_end,
+                "limit": PAGE_SIZE,
+                "offset": offset,
+                "timeout": QUERY_TIMEOUT,
+                "fields": fields_param(),
+            }
+            page = extract_records(request_page(session, params, stats))
+            if not page:
+                break
 
-    def worker(bounds_pair: Tuple[int, int]) -> List[Dict[str, Any]]:
-        if not hasattr(local, "session"):
-            local.session = build_session()
-        return fetch_window(local.session, query,
-                            bounds_pair[0], bounds_pair[1], stats)
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(worker, w): w for w in windows}
-        for future in as_completed(futures):
-            done += 1
-            try:
-                page = future.result()
-            except ApiError:
-                raise
-            except Exception as exc:
-                window = futures[future]
-                print(f"\n  ! window {window} failed: {exc}")
-                continue
-
-            # Dedupe on the main thread -- keeps `seen` single-threaded and
-            # avoids needing a lock around it.
             for record in page:
                 key = record.get("_id") or json.dumps(record, sort_keys=True)
                 if key not in seen:
                     seen.add(key)
                     all_records.append(record)
 
-            print(f"\r  {done}/{len(windows)} windows  "
-                  f"{len(all_records):>7} records  "
-                  f"{stats.get('calls', 0):>4} calls",
-                  end="", flush=True)
+            if len(page) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
+
+        progress(index, len(windows), len(all_records),
+                 stats.get("calls", 0))
 
     print()
     if stats.get("throttled"):
-        print(f"  note: hit the rate limit {stats['throttled']} time(s) -- "
-              f"lower RATE_LIMIT_PER_SEC or MAX_WORKERS if this is frequent")
+        print(f"  note: rate limited {stats['throttled']} time(s) -- "
+              f"raise REQUEST_DELAY if this is frequent")
+    if stats.get("server_errors"):
+        print(f"  note: {stats['server_errors']} server error(s) were "
+              f"retried -- lower PAGE_SIZE or TIME_WINDOW_SECONDS if "
+              f"this persists")
 
     return all_records
 
@@ -1074,10 +1014,8 @@ def probe(session: requests.Session, query: str, start: int, end: int,
 
 
 def main() -> int:
-    global THROTTLE
     stats: Dict[str, int] = {"calls": 0}
     started = time.time()
-    THROTTLE = Throttle(RATE_LIMIT_PER_SEC, RATE_LIMIT_COOLDOWN)
 
     if "PUT_YOUR_API_TOKEN" in API_TOKEN or "YOUR_TENANT" in BASE_URL:
         print("Set API_TOKEN and BASE_URL in the CONFIGURATION block first.")
