@@ -122,6 +122,30 @@ QUERY_TIMEOUT: int = 180                  # server-side query timeout
 # Ask the API for only the fields we export instead of ~100 per row.
 SEND_FIELDS_PARAM: bool = True
 
+# --- Activity enrichment (second endpoint) ----------------------------------
+# Netskope splits these deliberately: Page Events carry the traffic byte
+# counts but no activity; Application Events carry the activity (Post,
+# Message, Browse, Upload, Login) but no bytes. Neither endpoint alone can
+# fill this CSV.
+#
+# With this on, the script makes a SECOND pass over Application Events for
+# the same day and attaches the activities seen for each user+application
+# pair to the byte rows.
+#
+# CAVEAT worth understanding: this is a per-pair join, not a per-event one.
+# A user who both posted and browsed in ChatGPT gets ONE row whose bytes
+# are the day's total and whose Activity lists both. The activity does not
+# apportion the bytes -- there is no way to do that, because the two event
+# types don't share a per-event key.
+ENRICH_WITH_ACTIVITY: bool = True
+
+# Endpoint that carries the activity field.
+ACTIVITY_ENDPOINT_PATH: str = "/api/v2/events/datasearch/application"
+
+# How the activities for one user+app pair are combined.
+ACTIVITY_SEP: str = " | "
+MAX_ACTIVITIES: int = 4          # then "(+N more)"; 0 = no cap
+
 # Print every request and response. Turn this on FIRST when troubleshooting.
 DEBUG: bool = False
 
@@ -919,6 +943,9 @@ def resolve_field_aliases(rows: List[Dict[str, Any]]) -> None:
             log.warning("field  %s is present but EMPTY on every row "
                         "(no populated alternative among: %s)",
                         canonical, ", ".join(aliases))
+        elif canonical == "activity" and ENRICH_WITH_ACTIVITY:
+            log.info("field  activity not on this endpoint -- will be "
+                     "fetched from %s", ACTIVITY_ENDPOINT_PATH)
         else:
             log.warning("field  %s NOT FOUND (tried: %s) -- exports blank",
                         canonical, ", ".join(aliases))
@@ -2113,6 +2140,93 @@ def run_check(run_id: str, started: float) -> int:
     return finish(0, started, run_id)
 
 
+def fetch_activities(session: requests.Session, query: str,
+                     start: int, end: int,
+                     stats: Dict[str, int]) -> Dict[Tuple[str, str], List[str]]:
+    """
+    Second pass over Application Events, collecting the activities seen for
+    each (user, app) pair.
+
+    Returns {(user_key, app_key): [activity, ...]} with keys normalised the
+    same way dedupe_key does, so the lookup matches regardless of casing or
+    stray whitespace.
+
+    Only the three fields needed are requested, which keeps this pass cheap
+    compared with the main byte fetch.
+    """
+    url = BASE_URL.rstrip("/") + ACTIVITY_ENDPOINT_PATH
+    found: Dict[Tuple[str, str], List[str]] = {}
+
+    if TIME_WINDOW_SECONDS > 0:
+        bounds = list(range(start, end, TIME_WINDOW_SECONDS)) + [end]
+        windows = list(zip(bounds[:-1], bounds[1:]))
+    else:
+        windows = [(start, end)]
+
+    def norm(value: Any) -> str:
+        return " ".join(str(value or "").split()).casefold()
+
+    for w_start, w_end in windows:
+        offset = 0
+        while True:
+            params = {
+                "query": query,
+                "starttime": w_start,
+                "endtime": w_end,
+                "limit": PAGE_SIZE,
+                OFFSET_PARAM_NAME: offset,
+                "timeout": QUERY_TIMEOUT,
+                "fields": "user,app,activity",
+            }
+            page = extract_records(request_page(session, url, params, stats))
+            if not page:
+                break
+
+            for record in page:
+                row = flatten_record(record)
+                activity = str(row.get("activity") or "").strip()
+                if not activity:
+                    continue
+                key = (norm(row.get("user")), norm(row.get("app")))
+                if not key[0] or not key[1]:
+                    continue
+                bucket = found.setdefault(key, [])
+                if activity not in bucket:
+                    bucket.append(activity)
+
+            if len(page) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
+
+    return found
+
+
+def apply_activities(rows: List[Dict[str, Any]],
+                     lookup: Dict[Tuple[str, str], List[str]]) -> int:
+    """
+    Attach the collected activities to the byte rows. Returns how many rows
+    got a value, so a poor match rate is visible rather than silent.
+    """
+    def norm(value: Any) -> str:
+        return " ".join(str(value or "").split()).casefold()
+
+    matched = 0
+    for row in rows:
+        key = (norm(row.get("user")), norm(row.get("app")))
+        activities = lookup.get(key)
+        if not activities:
+            continue
+
+        values = list(activities)
+        if MAX_ACTIVITIES and len(values) > MAX_ACTIVITIES:
+            extra = len(values) - MAX_ACTIVITIES
+            values = values[:MAX_ACTIVITIES] + [f"(+{extra} more)"]
+        row["activity"] = ACTIVITY_SEP.join(values)
+        matched += 1
+
+    return matched
+
+
 def peek(session: requests.Session, start: int, end: int,
          stats: Dict[str, int]) -> None:
     """
@@ -2276,7 +2390,31 @@ def main() -> int:
 
     flat_rows = dedupe_rows(flat_rows)
 
+    # Second pass for activity. Done AFTER dedupe so the lookup runs once
+    # per final row rather than once per raw event.
+    if ENRICH_WITH_ACTIVITY and "activity" in DESIRED_COLUMNS:
+        log.info("Fetching activities from %s ...", ACTIVITY_ENDPOINT_PATH)
+        try:
+            lookup = fetch_activities(session, query, start, end, stats)
+            matched = apply_activities(flat_rows, lookup)
+            log.info("Activity: %d pair(s) found, %d of %d row(s) matched",
+                     len(lookup), matched, len(flat_rows))
+            if flat_rows and matched == 0:
+                log.warning("No activity matched any row. The two endpoints "
+                            "may name users/apps differently, or the "
+                            "Application Events feed is empty for this day.")
+            elif matched < len(flat_rows) * 0.5:
+                log.warning("Under half the rows got an activity -- some "
+                            "traffic has no matching application event.")
+        except ApiError as exc:
+            # Never lose the byte export over the enrichment pass.
+            log.warning("Activity fetch failed (%s) -- exporting without it.",
+                        str(exc)[:160])
+
     if DESIRED_COLUMNS:
+        # Recomputed AFTER enrichment, so a column filled in by the second
+        # pass isn't wrongly reported as missing.
+        discovered = discover_columns(flat_rows)
         missing = [c for c in DESIRED_COLUMNS if c not in discovered]
         if missing:
             log.warning("Requested columns absent from the data "
