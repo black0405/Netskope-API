@@ -67,6 +67,26 @@ REQUIRE_FIELDS: List[str] = ["user", "app"]
 BLANK_VALUES: Tuple[str, ...] = ("", "-", "n/a", "na", "null", "none",
                                  "unknown", "unknown user", "0")
 
+# --- Multi-value fields (usergroup) -----------------------------------------
+# usergroup is a LIST: a user can belong to hundreds of AD groups, and each
+# value is a full DN containing commas, quotes and NEWLINES. Written raw,
+# those newlines terminate the CSV row early -- one real row explodes into
+# dozens of fragments, which is where "garbage rows" of bare group paths,
+# stray 0s and HTML come from.
+#
+# MAX_MULTIVALUE : keep at most this many values per cell (0 = all)
+# SHORTEN_DN     : reduce each DN to its last path segment, so
+#                  ".../Managed Groups/BRAHMA/BRAHMA-PG_GERAL" -> "BRAHMA-PG_GERAL"
+MULTIVALUE_FIELDS: Tuple[str, ...] = ("usergroup", "user_group", "groups",
+                                      "department", "organization_unit")
+MAX_MULTIVALUE: int = 5
+MULTIVALUE_SEP: str = " | "
+SHORTEN_DN: bool = True
+
+# Any cell longer than this is truncated (0 = no limit). A safety net for
+# fields that turn out to be huge blobs.
+MAX_CELL_LENGTH: int = 500
+
 # --- Which day to pull ------------------------------------------------------
 # "yesterday" | "today" | "date" | "rolling"
 # A date on the command line overrides this:
@@ -1332,10 +1352,75 @@ def bytes_to_mb(value: Any) -> Any:
     return round(size / (1024 * 1024), MB_DECIMALS)
 
 
+def sanitize_text(value: Any) -> Any:
+    """
+    Make a value safe to sit in a CSV cell.
+
+    THIS is what stops group paths, stray zeros and HTML fragments showing
+    up as extra rows. Netskope's multi-value fields carry embedded newlines
+    and carriage returns; a newline inside a cell ends the record, so every
+    field after it shifts into the wrong column and one row becomes many.
+
+    Strips CR/LF/tab, removes stray double quotes, and collapses runs of
+    whitespace.
+    """
+    if not isinstance(value, str):
+        return value
+    cleaned = value.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    cleaned = cleaned.replace('"', "")
+    return " ".join(cleaned.split())
+
+
+def shorten_dn(value: str) -> str:
+    """Reduce an AD DN to its final path segment."""
+    text = value.strip().strip('"').strip()
+    if "/" in text:
+        text = text.rsplit("/", 1)[-1]
+    return text.strip()
+
+
+def tidy_multivalue(value: Any) -> Any:
+    """
+    Shorten and cap a multi-valued cell.
+
+    Splits on the separator flatten_record used, optionally reduces each
+    entry to its last DN segment, drops duplicates, caps the count, and
+    appends "(+N more)" so nothing looks silently truncated.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return value
+
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    if SHORTEN_DN:
+        parts = [shorten_dn(p) for p in parts]
+
+    seen: set = set()
+    unique: List[str] = []
+    for part in parts:
+        if part and part.casefold() not in seen:
+            seen.add(part.casefold())
+            unique.append(part)
+
+    if MAX_MULTIVALUE and len(unique) > MAX_MULTIVALUE:
+        extra = len(unique) - MAX_MULTIVALUE
+        unique = unique[:MAX_MULTIVALUE] + [f"(+{extra} more)"]
+
+    return MULTIVALUE_SEP.join(unique)
+
+
+def cap_length(value: Any) -> Any:
+    """Truncate an over-long cell, marking that it was cut."""
+    if not MAX_CELL_LENGTH or not isinstance(value, str):
+        return value
+    if len(value) <= MAX_CELL_LENGTH:
+        return value
+    return value[:MAX_CELL_LENGTH] + " ...(truncated)"
+
+
 def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> None:
     """
     Write to CSV with every discovered field as a column. Missing values are
-    written blank. QUOTE_MINIMAL keeps embedded commas safe. RENAME_COLUMNS,
+    written blank. Every field is quoted. RENAME_COLUMNS,
     if set, relabels headers for columns that are actually present.
 
     Dedupe is applied HERE rather than at the call sites, so that every
@@ -1344,20 +1429,22 @@ def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> Non
     """
     rows = dedupe_rows(rows)
     frame = pd.DataFrame(rows, columns=columns)
-    # Trim stray leading/trailing whitespace so the CSV doesn't carry the
-    # padding that some source fields arrive with.
-    for column in frame.columns:
-        if frame[column].dtype == object:
-            frame[column] = frame[column].apply(
-                lambda v: v.strip() if isinstance(v, str) else v
-            )
     frame = frame.where(pd.notnull(frame), "")
-    # Convert epoch fields to readable dates before headers get renamed.
+
     for column in frame.columns:
         if column in EPOCH_FIELDS:
             frame[column] = frame[column].apply(format_epoch)
         elif column in BYTES_FIELDS:
+            # Forced numeric: stray text in a byte column becomes 0 rather
+            # than corrupting the column.
             frame[column] = frame[column].apply(bytes_to_mb)
+        else:
+            # Sanitize FIRST -- strip the newlines that would split the row
+            # -- then tidy multi-value cells and cap the length.
+            frame[column] = frame[column].apply(sanitize_text)
+            if column in MULTIVALUE_FIELDS:
+                frame[column] = frame[column].apply(tidy_multivalue)
+            frame[column] = frame[column].apply(cap_length)
 
     if RENAME_COLUMNS:
         frame = frame.rename(columns=RENAME_COLUMNS)
@@ -1384,8 +1471,12 @@ def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> Non
             engine="openpyxl",
         )
     else:
-        frame.to_csv(path, index=False, quoting=csv.QUOTE_MINIMAL,
-                     encoding="utf-8")
+        # QUOTE_ALL rather than QUOTE_MINIMAL: these values contain commas,
+        # slashes and quotes by nature. Quoting everything removes any
+        # chance of a stray delimiter shifting columns. The BOM makes Excel
+        # open it as UTF-8 instead of mangling accented characters.
+        frame.to_csv(path, index=False, quoting=csv.QUOTE_ALL,
+                     encoding="utf-8-sig")
 
 
 # ---------------------------------------------------------------------------
