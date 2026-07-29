@@ -38,8 +38,21 @@ BASE_URL: str = "https://YOUR_TENANT.goskope.com"
 # If you get 401s, try the other one.
 AUTH_MODE: str = "bearer"
 
-# The datasearch endpoint is the one that supports the `query` filter.
-ENDPOINT_PATH: str = "/api/v2/events/datasearch/application"
+# WHICH EVENT TYPE -- this decides whether you get byte columns at all.
+#
+#   page         Skope IT > Page Events.  HAS the traffic byte counts
+#                (Total Bytes / Bytes Uploaded / Bytes Downloaded).
+#                Netskope's own aggregation example uses this endpoint.
+#   application  Skope IT > Application Events. Activity detail (Login,
+#                Upload, Share, object names) but NO byte fields -- per
+#                Netskope's docs, "you can view activities of an app in
+#                application events and view bytes information in page
+#                events". This is why the byte columns came back empty.
+#
+# Use "page" for the byte report; "application" only if you want activity
+# and object detail instead.
+EVENT_TYPE: str = "page"
+ENDPOINT_PATH: str = f"/api/v2/events/datasearch/{EVENT_TYPE}"
 
 # --- Filter ----------------------------------------------------------------
 # appcategory is the CCI *application* category. `category` is the web/URL
@@ -137,18 +150,25 @@ GROUP_BY: List[str] = ["user", "app", "organization_unit"]
 # Aggregate expressions: output name -> the sum() over the source field.
 # If a run errors with "unknown field", peek first and adjust the inner
 # names to whatever your tenant actually exposes.
+# Confirmed from Netskope's documented example on the page endpoint:
+#   fields=server_bytes=sum(server_bytes_total),
+#          client_bytes=sum(client_bytes_total),
+#          numbytes=sum(numbytes_total)
+#
+#   client_bytes = bytes FROM the end-user client  -> Bytes Uploaded
+#   server_bytes = bytes FROM the destination site -> Bytes Downloaded
 AGGREGATIONS: Dict[str, str] = {
-    "numbytes":     "sum(numbytes)",
-    "server_bytes": "sum(server_bytes)",
-    "client_bytes": "sum(client_bytes)",
+    "numbytes":     "sum(numbytes_total)",
+    "server_bytes": "sum(server_bytes_total)",
+    "client_bytes": "sum(client_bytes_total)",
 }
 
 # Fallback aggregate expressions tried if the first set is rejected.
 AGGREGATION_FALLBACKS: List[Dict[str, str]] = [
     {
-        "numbytes":     "sum(numbytes_total)",
-        "server_bytes": "sum(server_bytes_total)",
-        "client_bytes": "sum(client_bytes_total)",
+        "numbytes":     "sum(numbytes)",
+        "server_bytes": "sum(server_bytes)",
+        "client_bytes": "sum(client_bytes)",
     },
 ]
 
@@ -952,6 +972,14 @@ def main() -> int:
     print(f"\nDay      : {label}")
     print(f"Query    : {query}")
     print(f"Endpoint : {BASE_URL.rstrip('/')}{ENDPOINT_PATH}")
+
+    # The single most common cause of empty byte columns.
+    wants_bytes = any(f in BYTE_ALIASES for f, _h in COLUMNS)
+    if wants_bytes and EVENT_TYPE == "application":
+        print("\n  [!] EVENT_TYPE='application' but the export asks for byte")
+        print("      columns. Application Events carry activity detail, not")
+        print("      traffic bytes -- those live on Page Events. Set")
+        print("      EVENT_TYPE = 'page' or drop the byte columns.")
 
     session = build_session()
 
