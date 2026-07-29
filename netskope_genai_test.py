@@ -17,7 +17,9 @@ import csv
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -83,6 +85,26 @@ QUERY_TIMEOUT: int = 180             # server-side query timeout
 REQUEST_TIMEOUT: int = 60            # per-HTTP-request timeout
 MAX_RETRIES: int = 5
 DEBUG: bool = False                  # print every request/response
+
+# --- Parallelism ------------------------------------------------------------
+# Time windows are fetched concurrently. More workers is faster but pushes
+# harder against the rate limit -- parallelism does NOT avoid throttling,
+# it reaches it sooner. RATE_LIMIT_PER_SEC is what actually keeps you under
+# the ceiling; MAX_WORKERS just decides how much work waits behind it.
+#
+# Netskope's documented limit for the events endpoints is on the order of a
+# few requests/second per tenant. Start conservative and raise it only if
+# you never see a 429.
+MAX_WORKERS: int = 4
+
+# Requests per second across ALL workers combined. 0 disables throttling.
+RATE_LIMIT_PER_SEC: float = 3.0
+
+# When any worker gets a 429, every worker pauses for this long. Backing off
+# globally is the point: if one thread is being throttled the others are
+# about to be too, and letting them keep hammering turns a brief slowdown
+# into a long one.
+RATE_LIMIT_COOLDOWN: float = 10.0
 
 # One row per user+application, byte columns summed. [] = every raw event.
 DEDUPE_ON: List[str] = ["user", "app"]
@@ -272,6 +294,71 @@ class ApiError(RuntimeError):
     """Non-recoverable API problem."""
 
 
+class Throttle:
+    """
+    Shared rate limiter for all worker threads.
+
+    Two mechanisms:
+
+      1. A minimum gap between requests, so the combined rate across every
+         worker stays at or below RATE_LIMIT_PER_SEC. This is what keeps
+         you under the limit -- concurrency alone would blow straight
+         through it.
+
+      2. A global cooldown gate. When any worker sees a 429 it sets a
+         "resume at" time and EVERY worker waits until then. Without this,
+         the other threads keep hammering an endpoint that has already said
+         no, which extends the throttling instead of clearing it.
+    """
+
+    def __init__(self, per_second: float, cooldown: float) -> None:
+        self._min_gap = 1.0 / per_second if per_second > 0 else 0.0
+        self._cooldown = cooldown
+        self._lock = threading.Lock()
+        self._next_slot = 0.0
+        self._resume_at = 0.0
+
+    def acquire(self) -> None:
+        """
+        Block until this thread may make a request.
+
+        Loops rather than computing a single wait: another thread can start
+        a cooldown while this one is sleeping, and the earlier version
+        returned without re-checking, which let workers sail straight
+        through a 429 pause.
+        """
+        while True:
+            with self._lock:
+                now = time.monotonic()
+
+                # Cooldown gate first -- it overrides the rate slot.
+                if now < self._resume_at:
+                    wait = self._resume_at - now
+                else:
+                    slot = max(now, self._next_slot)
+                    if slot <= now:
+                        # A slot is available right now; claim it.
+                        self._next_slot = now + self._min_gap
+                        return
+                    wait = slot - now
+
+            # Sleep in short bounces so a cooldown started by another
+            # thread is noticed promptly, then re-evaluate from scratch.
+            time.sleep(min(wait, 0.25))
+
+    def penalise(self, seconds: Optional[float] = None) -> None:
+        """Called on a 429 -- pauses every worker."""
+        with self._lock:
+            pause = seconds if seconds else self._cooldown
+            self._resume_at = max(self._resume_at,
+                                  time.monotonic() + pause)
+
+
+# Shared across threads; created in main().
+THROTTLE: Optional[Throttle] = None
+STATS_LOCK = threading.Lock()
+
+
 def build_session() -> requests.Session:
     """Session with the auth header applied once."""
     session = requests.Session()
@@ -290,7 +377,10 @@ def request_page(session: requests.Session, params: Dict[str, Any],
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            stats["calls"] += 1
+            if THROTTLE:
+                THROTTLE.acquire()
+            with STATS_LOCK:
+                stats["calls"] = stats.get("calls", 0) + 1
             if DEBUG:
                 print(f"  [DEBUG] GET {url}")
                 print(f"  [DEBUG] params {params}")
@@ -309,8 +399,13 @@ def request_page(session: requests.Session, params: Dict[str, Any],
 
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After", "")
-            wait = int(retry_after) if retry_after.isdigit() else 2 ** attempt
-            print(f"  ! rate limited -- sleeping {wait}s")
+            wait = float(retry_after) if retry_after.isdigit() else 2 ** attempt
+            # Pause EVERY worker, not just this one.
+            if THROTTLE:
+                THROTTLE.penalise(wait)
+            with STATS_LOCK:
+                stats["throttled"] = stats.get("throttled", 0) + 1
+            print(f"\n  ! rate limited (429) -- all workers pausing {wait:.0f}s")
             time.sleep(wait)
             continue
 
@@ -410,15 +505,56 @@ def fetch_aggregate(session: requests.Session, query: str,
     return rows
 
 
+def fetch_window(session: requests.Session, query: str,
+                 w_start: int, w_end: int,
+                 stats: Dict[str, int]) -> List[Dict[str, Any]]:
+    """
+    Fetch every page for ONE time window. Runs on a worker thread.
+
+    Paging stays sequential within a window because each offset depends on
+    the previous page's size -- only the windows themselves parallelise.
+    """
+    records: List[Dict[str, Any]] = []
+    offset = 0
+
+    while True:
+        params = {
+            "query": query,
+            "starttime": w_start,
+            "endtime": w_end,
+            "limit": PAGE_SIZE,
+            "offset": offset,
+            "timeout": QUERY_TIMEOUT,
+            "fields": fields_param(),
+        }
+        page = extract_records(request_page(session, params, stats))
+        if not page:
+            break
+
+        records.extend(page)
+        if len(page) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+
+    return records
+
+
 def fetch_all(session: requests.Session, query: str,
               start: int, end: int, stats: Dict[str, int]
               ) -> List[Dict[str, Any]]:
     """
-    Pull every record for the day.
+    Pull every record for the day, fetching time windows in parallel.
 
-    The day is split into windows because offset pagination on this API
-    degrades past ~10k rows in one query (the backend re-sorts between
-    pages, producing duplicates and gaps). Records are deduped on _id.
+    The day is split into windows because offset pagination degrades past
+    ~10k rows in one query (the backend re-sorts between pages, producing
+    duplicates and gaps). Those windows are independent, which is exactly
+    what makes them safe to run concurrently.
+
+    Throughput is governed by the shared Throttle, not by MAX_WORKERS --
+    adding workers without raising RATE_LIMIT_PER_SEC just adds queueing.
+
+    Results are deduped on _id, so an overlap between windows can't
+    double-count.
     """
     if TIME_WINDOW_SECONDS > 0:
         bounds = list(range(start, end, TIME_WINDOW_SECONDS)) + [end]
@@ -426,40 +562,54 @@ def fetch_all(session: requests.Session, query: str,
     else:
         windows = [(start, end)]
 
+    workers = max(1, min(MAX_WORKERS, len(windows)))
+    print(f"  {len(windows)} window(s), {workers} worker(s), "
+          f"{RATE_LIMIT_PER_SEC}/s limit")
+
     seen: set = set()
     all_records: List[Dict[str, Any]] = []
+    done = 0
 
-    for index, (w_start, w_end) in enumerate(windows, 1):
-        offset = 0
-        while True:
-            params = {
-                "query": query,
-                "starttime": w_start,
-                "endtime": w_end,
-                "limit": PAGE_SIZE,
-                "offset": offset,
-                "timeout": QUERY_TIMEOUT,
-                "fields": fields_param(),
-            }
-            page = extract_records(request_page(session, params, stats))
-            if not page:
-                break
+    # A Session isn't guaranteed thread-safe, so each worker gets its own.
+    local = threading.local()
 
+    def worker(bounds_pair: Tuple[int, int]) -> List[Dict[str, Any]]:
+        if not hasattr(local, "session"):
+            local.session = build_session()
+        return fetch_window(local.session, query,
+                            bounds_pair[0], bounds_pair[1], stats)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(worker, w): w for w in windows}
+        for future in as_completed(futures):
+            done += 1
+            try:
+                page = future.result()
+            except ApiError:
+                raise
+            except Exception as exc:
+                window = futures[future]
+                print(f"\n  ! window {window} failed: {exc}")
+                continue
+
+            # Dedupe on the main thread -- keeps `seen` single-threaded and
+            # avoids needing a lock around it.
             for record in page:
                 key = record.get("_id") or json.dumps(record, sort_keys=True)
                 if key not in seen:
                     seen.add(key)
                     all_records.append(record)
 
-            if len(page) < PAGE_SIZE:
-                break
-            offset += PAGE_SIZE
-
-        print(f"\r  window {index}/{len(windows)}  "
-              f"{len(all_records):>7} records  {stats['calls']:>4} calls",
-              end="", flush=True)
+            print(f"\r  {done}/{len(windows)} windows  "
+                  f"{len(all_records):>7} records  "
+                  f"{stats.get('calls', 0):>4} calls",
+                  end="", flush=True)
 
     print()
+    if stats.get("throttled"):
+        print(f"  note: hit the rate limit {stats['throttled']} time(s) -- "
+              f"lower RATE_LIMIT_PER_SEC or MAX_WORKERS if this is frequent")
+
     return all_records
 
 
@@ -787,8 +937,10 @@ def peek(session: requests.Session, query: str, start: int, end: int,
 
 
 def main() -> int:
+    global THROTTLE
     stats: Dict[str, int] = {"calls": 0}
     started = time.time()
+    THROTTLE = Throttle(RATE_LIMIT_PER_SEC, RATE_LIMIT_COOLDOWN)
 
     if "PUT_YOUR_API_TOKEN" in API_TOKEN or "YOUR_TENANT" in BASE_URL:
         print("Set API_TOKEN and BASE_URL in the CONFIGURATION block first.")
