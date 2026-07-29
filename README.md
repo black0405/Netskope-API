@@ -18,25 +18,36 @@ document library. Built to run unattended on a schedule.
 
 ## Output columns
 
-| Column | Source field |
-|---|---|
-| *(row number)* | generated |
-| User | `user` |
-| Application | `app` |
-| URL | `url` |
-| Activity | `activity` |
-| Object Type | `object_type` |
-| Object Name | `object` |
-| Event Date | `timestamp` (formatted) |
-| Organization Unit | `organization_unit` |
-| Sum - File Size (MB) | `file_size` (summed, bytes → MB) |
+| # | Column | Source field |
+|---|---|---|
+| 1 | S.No. | generated |
+| 2 | Application | `app` |
+| 3 | User | `user` |
+| 4 | URL | `url` |
+| 5 | Event Date | `timestamp` (formatted) |
+| 6 | User Group | `usergroup` |
+| 7 | Organization Unit | `organization_unit` |
+| 8 | Sum - Total Bytes (MB) | `numbytes` |
+| 9 | Sum - Bytes Downloaded (MB) | `server_bytes` |
+| 10 | Sum - Bytes Uploaded (MB) | `client_bytes` |
+
+Rows are collapsed to one per **user + application**, with the three byte
+columns summed across every event in that pair and converted bytes -> MB.
+
+Byte field names vary between Netskope schemas, so the script tries a list
+of aliases (`numbytes` / `numbytes_total` / `total_bytes` ...) and logs
+which one it found.
 
 ## Requirements
 
-- Python 3.8+
-- `pip install requests pandas msal`
+- Python 3.8+ (RHEL 9's system Python 3.9 works as-is)
+- `pip install -r requirements.txt`
 
 `msal` is only needed if SharePoint upload is enabled.
+Optional: `tmux` (or `screen`) for the interactive session wrapper.
+
+See [RHEL9_SETUP.md](RHEL9_SETUP.md) for RHEL 9 deployment with systemd
+timers, SELinux notes, and service-account setup.
 
 ## Setup
 
@@ -67,7 +78,24 @@ python export_genai_applications.py --check
 
 # Print the one-time SharePoint site-grant command for an admin
 python export_genai_applications.py --grant-help
+
+# Skip the screen/tmux session wrapper
+python export_genai_applications.py --no-screen
 ```
+
+### Interactive session wrapper
+
+Run by hand at a terminal and the script relaunches itself inside a session
+named **Netskope GenAI**, so a long extraction survives an SSH drop:
+
+```
+Starting inside tmux session: Netskope GenAI
+  detach   : Ctrl-B then D
+  reattach : tmux attach -t "Netskope GenAI"
+```
+
+This is skipped automatically under cron and systemd — there's no terminal,
+so scheduled runs are unaffected.
 
 ## Exit codes
 
@@ -115,7 +143,7 @@ NETSKOPE_CONFIG_FILE=/etc/netskope/prod.env python export_genai_applications.py
   production hosts
 - The SPN needs Microsoft Graph **`Sites.Selected`** (application
   permission) *plus* a site-level grant on the target site. The API
-  permission alone grants nothing run `--grant-help` for the command
+  permission alone grants nothing — run `--grant-help` for the command
 - Client secrets expire; when they do the export keeps working and only
   the upload fails (exit 4). Worth a calendar reminder
 

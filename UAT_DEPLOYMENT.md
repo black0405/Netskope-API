@@ -44,7 +44,7 @@ Fill in, at minimum:
 |---|---|
 | `NETSKOPE_BASE_URL` | UAT tenant URL |
 | `NETSKOPE_API_TOKEN` | REST API v2 token |
-| `GRAPH_TENANT_ID` / `GRAPH_CLIENT_ID` / `GRAPH_CLIENT_SECRET` | the SPN |
+| `SPN_TENANT_ID` / `SPN_CLIENT_ID` / `SPN_CLIENT_SECRET` | the SPN |
 | `SHAREPOINT_SITE_HOSTNAME` / `SHAREPOINT_SITE_PATH` | target site |
 | `OUTPUT_DIR` / `LOG_DIR` | **use absolute paths** for scheduled runs |
 

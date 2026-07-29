@@ -1,0 +1,57 @@
+# ===========================================================================
+# SECRETS -- never commit these
+# ===========================================================================
+# The script reads any of these names. config.env.example is the safe
+# template that IS committed; the real ones never are.
+config.env
+api_tokens.env
+config.ini
+.env
+*.env
+!*.env.example
+!config.env.example
+
+# Certificates / keys, if you switch off client secrets later
+*.pem
+*.pfx
+*.key
+*.p12
+
+
+# ===========================================================================
+# GENERATED DATA -- exported customer data must not land in git
+# ===========================================================================
+output/
+*.csv
+!sample*.csv
+
+logs/
+*.log
+*.log.*
+
+
+# ===========================================================================
+# PYTHON
+# ===========================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+
+# ===========================================================================
+# EDITORS / OS
+# ===========================================================================
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

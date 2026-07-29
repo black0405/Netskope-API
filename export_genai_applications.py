@@ -12,6 +12,8 @@ import csv
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import time
 import zipfile
@@ -370,10 +372,22 @@ SHAREPOINT_ENABLED: bool = env_bool("SHAREPOINT_ENABLED", True)
 # SECURITY: prefer environment variables over hardcoding the secret. The
 # script reads these env vars first and only falls back to the constants
 # below if they're unset:
-#     GRAPH_TENANT_ID / GRAPH_CLIENT_ID / GRAPH_CLIENT_SECRET
-TENANT_ID: str = env_str("GRAPH_TENANT_ID", "PUT_TENANT_ID_HERE")
-CLIENT_ID: str = env_str("GRAPH_CLIENT_ID", "PUT_CLIENT_ID_HERE")
-CLIENT_SECRET: str = env_str("GRAPH_CLIENT_SECRET", "PUT_CLIENT_SECRET_HERE")
+#     SPN_TENANT_ID / SPN_CLIENT_ID / SPN_CLIENT_SECRET
+# These three come from the SPN (Entra ID app registration) your admin
+# created. They are static values you paste into the config file.
+#
+# Not to be confused with the Graph ACCESS TOKEN, which the script fetches
+# at runtime by exchanging these three -- that one is short-lived and is
+# never configured anywhere.
+#
+# GRAPH_* names are still accepted for backwards compatibility.
+TENANT_ID: str = env_str("SPN_TENANT_ID",
+                         env_str("GRAPH_TENANT_ID", "PUT_TENANT_ID_HERE"))
+CLIENT_ID: str = env_str("SPN_CLIENT_ID",
+                         env_str("GRAPH_CLIENT_ID", "PUT_CLIENT_ID_HERE"))
+CLIENT_SECRET: str = env_str("SPN_CLIENT_SECRET",
+                             env_str("GRAPH_CLIENT_SECRET",
+                                     "PUT_CLIENT_SECRET_HERE"))
 
 # Where to put the file. Two ways to identify the site:
 #   A) leave SITE_ID blank and fill in the hostname + path, and the script
@@ -452,30 +466,37 @@ BASE_FILTER_OPERATOR: str = env_str("FILTER_OPERATOR", "in")
 # A column listed here that never appears in the data is still exported,
 # blank, as required.
 #
-# Mapped from the requested business columns to the REAL Netskope field
-# names in this event schema. Three had no clean match -- see the comments;
-# swap them if your tenant exposes a better field:
-#   Object Type       -> "object_type"  (File / Folder / Message ...)
-#   Object Name       -> "object"       (the named object, when the event
-#                                        involves one -- blank otherwise)
+# BYTE FIELD NAMES -- read this before troubleshooting empty byte columns.
+# Netskope's own datasearch docs show the traffic totals as:
+#     numbytes        total bytes
+#     client_bytes    bytes sent BY the client   -> uploaded
+#     server_bytes    bytes sent BY the server   -> downloaded
+# Some tenants/schemas expose the "_total" variants instead. Rather than
+# guess, BYTE_FIELD_ALIASES below lists the candidates and the script uses
+# whichever actually appears in the data.
 DESIRED_COLUMNS: List[str] = [
-    "user",                # User
     "app",                 # Application
+    "user",                # User
     "url",                 # URL
-    "activity",            # Activity
-    "object_type",         # Object Type  (NOT `type` -- that's the event
-                           #   type: nspolicy/connection/etc.)
-    "object",              # Object Name  (the named file/folder/message)
-    "timestamp",          # Event Date     (epoch; see RENAME note)
+    "timestamp",           # Event Date  (epoch -> DATE_FORMAT)
+    "usergroup",           # User Group
     "organization_unit",   # Organization Unit
-    "file_size",           # Sum - File Size (MB)  (raw field is BYTES;
-                           #   summed across the user+app pair, then
-                           #   converted to MB on export)
-    # Uncomment to also see whether each row was allowed/blocked and whether
-    # it raised an alert -- useful for confirming a block-only dataset:
-    # "action",
-    # "alert",
+    "numbytes",            # Sum - Total Bytes (MB)
+    "server_bytes",        # Sum - Bytes Downloaded (MB)
+    "client_bytes",        # Sum - Bytes Uploaded (MB)
 ]
+
+# Alternative names for the same measure, tried in order. The first one
+# present in the returned data wins, and its values are copied onto the
+# canonical name used in DESIRED_COLUMNS. This makes the export resilient
+# to the naming differences between Netskope schemas.
+BYTE_FIELD_ALIASES: Dict[str, List[str]] = {
+    "numbytes":     ["numbytes", "numbytes_total", "total_bytes", "bytes"],
+    "server_bytes": ["server_bytes", "server_bytes_total",
+                     "bytes_downloaded", "download_bytes"],
+    "client_bytes": ["client_bytes", "client_bytes_total",
+                     "bytes_uploaded", "upload_bytes"],
+}
 
 # Columns in DESIRED_COLUMNS that do NOT exist in the API schema. They are
 # still written to the CSV (blank) but are never sent in the `fields`
@@ -483,21 +504,19 @@ DESIRED_COLUMNS: List[str] = [
 PLACEHOLDER_COLUMNS: set = set()
 
 # Ask the API to return ONLY the fields we actually export, via the
-# datasearch `fields` parameter (e.g. fields=app,category). This cuts the
-# response from ~100 fields per row down to the handful you need, which is
-# the single biggest speed-up available for a full-day pull. Set to False
-# to pull every field instead (useful when exploring the schema).
-SEND_FIELDS_PARAM: bool = True
+# datasearch `fields` parameter (e.g. fields=app,user). This cuts the
+# response from ~100 fields per row down to the handful you need.
+#
+# NOTE: because the byte field names vary by schema, the request asks for
+# every alias in BYTE_FIELD_ALIASES. Unknown field names are ignored by the
+# API rather than rejected. If your tenant errors on this, set to False and
+# the script will pull everything and pick the right columns locally.
+SEND_FIELDS_PARAM: bool = env_bool("SEND_FIELDS_PARAM", True)
 
 # Collapse the export to unique combinations of these fields. With
-# ["user", "app"] each user/application pair appears once, keeping the
-# values from that pair's first event for the remaining columns. Set to an
-# empty list to export every raw event row instead.
-#
-# NOTE: if you'd rather have a bare two-column list of distinct user/app
-# pairs with no other columns, also trim DESIRED_COLUMNS down to
-# ["user", "app"] -- the dedupe key and the exported columns are
-# independent on purpose.
+# ["user", "app"] each user/application pair appears once, and the byte
+# columns are SUMMED across every event that collapses into that pair --
+# which is what makes them genuine "Sum -" figures.
 DEDUPE_ON: List[str] = ["user", "app"]
 
 # Epoch fields (like `timestamp`) are converted to readable dates on export.
@@ -513,42 +532,43 @@ DATE_FORMAT: str = env_str("DATE_FORMAT", "%m/%d/%Y")
 EPOCH_FIELDS: set = {"timestamp", "_insertion_epoch_timestamp",
                      "_creation_timestamp", "src_time"}
 
-# Numeric fields that should be ADDED UP across rows collapsed by DEDUPE_ON,
-# rather than taking the first row's value. This is what makes the file size
-# column a genuine "Sum" per user+application pair instead of a single
-# event's size.
-SUM_FIELDS: set = {"file_size"}
+# Numeric fields ADDED UP across rows collapsed by DEDUPE_ON, rather than
+# taking the first row's value. This is what turns per-event byte counts
+# into a per user+application total.
+SUM_FIELDS: set = {"numbytes", "server_bytes", "client_bytes", "file_size"}
 
 # Fields holding a byte count that should be converted to MB on export.
-BYTES_FIELDS: set = {"file_size"}
+BYTES_FIELDS: set = {"numbytes", "server_bytes", "client_bytes", "file_size"}
 
 # Decimal places for the MB conversion.
-MB_DECIMALS: int = 2
+MB_DECIMALS: int = env_int("MB_DECIMALS", 2)
 
-# Prepend an unnamed leftmost column holding a row counter, so the first
-# data row (spreadsheet row 2, since row 1 is the header) is numbered
-# ROW_NUMBER_START. Set ROW_NUMBER_START = 2 if you want the values to
-# match the spreadsheet's own row numbers instead of counting from 1.
+# Prepend a leftmost column holding a row counter, so the first data row
+# (spreadsheet row 2, since row 1 is the header) is numbered
+# ROW_NUMBER_START.
 ADD_ROW_NUMBER: bool = True
 ROW_NUMBER_START: int = 1
 
-# Header text for that column. "" leaves the heading blank. If your
-# spreadsheet tool mishandles a blank first heading, set this to something
-# like "S.No" or "#".
-ROW_NUMBER_HEADER: str = ""
+# Header text for that column. Set to "" for a blank heading.
+ROW_NUMBER_HEADER: str = env_str("ROW_NUMBER_HEADER", "S.No.")
 
 # Rename the technical field names to the friendly headers you asked for.
 # Only applied to columns actually present in DESIRED_COLUMNS above.
 RENAME_COLUMNS: Dict[str, str] = {
-    "user": "User",
     "app": "Application",
+    "user": "User",
     "url": "URL",
+    "timestamp": "Event Date",
+    "usergroup": "User Group",
+    "organization_unit": "Organization Unit",
+    "numbytes": "Sum - Total Bytes (MB)",
+    "server_bytes": "Sum - Bytes Downloaded (MB)",
+    "client_bytes": "Sum - Bytes Uploaded (MB)",
+    # kept in case they're re-added to DESIRED_COLUMNS
     "activity": "Activity",
     "object_type": "Object Type",
     "object": "Object Name",
     "file_size": "Sum - File Size (MB)",
-    "timestamp": "Event Date",
-    "organization_unit": "Organization Unit",
     "action": "Action",
     "alert": "Alert",
 }
@@ -828,8 +848,49 @@ def fields_param() -> Optional[str]:
     """
     if not SEND_FIELDS_PARAM or not DESIRED_COLUMNS:
         return None
-    real = [c for c in DESIRED_COLUMNS if c not in PLACEHOLDER_COLUMNS]
-    return ",".join(real) if real else None
+
+    wanted: List[str] = []
+    for column in DESIRED_COLUMNS:
+        if column in PLACEHOLDER_COLUMNS:
+            continue
+        # Ask for every known alias of a byte field, since the exact name
+        # varies by schema. Unknown names are ignored by the API.
+        for name in BYTE_FIELD_ALIASES.get(column, [column]):
+            if name not in wanted:
+                wanted.append(name)
+
+    return ",".join(wanted) if wanted else None
+
+
+def resolve_byte_aliases(rows: List[Dict[str, Any]]) -> None:
+    """
+    Normalise byte-field naming, in place.
+
+    Whichever alias the tenant actually returned is copied onto the
+    canonical name used in DESIRED_COLUMNS, so the export doesn't care
+    whether the schema says `numbytes` or `numbytes_total`. Logs which
+    alias won, so an empty byte column is diagnosable at a glance.
+    """
+    if not rows:
+        return
+
+    present: set = set()
+    for row in rows[:50]:          # sampling is enough to spot the schema
+        present.update(row.keys())
+
+    for canonical, aliases in BYTE_FIELD_ALIASES.items():
+        if canonical in present:
+            continue               # already the right name
+
+        match = next((a for a in aliases if a in present), None)
+        if match:
+            log.info("byte field  %s -> using '%s'", canonical, match)
+            for row in rows:
+                if match in row:
+                    row[canonical] = row[match]
+        else:
+            log.warning("byte field  %s NOT FOUND (tried: %s) -- that column "
+                        "will export as 0", canonical, ", ".join(aliases))
 
 
 def render_progress(stats: Dict[str, int], bar_width: int = 28) -> None:
@@ -1386,9 +1447,14 @@ def graph_credentials() -> Tuple[str, str, str]:
     """
     import os
 
-    tenant = os.environ.get("GRAPH_TENANT_ID") or TENANT_ID
-    client = os.environ.get("GRAPH_CLIENT_ID") or CLIENT_ID
-    secret = os.environ.get("GRAPH_CLIENT_SECRET") or CLIENT_SECRET
+    # SPN_* is the current name; GRAPH_* is accepted as a legacy alias so
+    # an older config file keeps working after the rename.
+    tenant = (os.environ.get("SPN_TENANT_ID")
+              or os.environ.get("GRAPH_TENANT_ID") or TENANT_ID)
+    client = (os.environ.get("SPN_CLIENT_ID")
+              or os.environ.get("GRAPH_CLIENT_ID") or CLIENT_ID)
+    secret = (os.environ.get("SPN_CLIENT_SECRET")
+              or os.environ.get("GRAPH_CLIENT_SECRET") or CLIENT_SECRET)
 
     missing = [
         name for name, value in
@@ -1398,8 +1464,8 @@ def graph_credentials() -> Tuple[str, str, str]:
     if missing:
         raise UploadError(
             f"Missing SharePoint credential(s): {', '.join(missing)}. "
-            f"Set GRAPH_TENANT_ID / GRAPH_CLIENT_ID / GRAPH_CLIENT_SECRET as "
-            f"environment variables, or fill the constants at the top."
+            f"Set SPN_TENANT_ID / SPN_CLIENT_ID / SPN_CLIENT_SECRET in "
+            f"{os.path.basename(CONFIG_FILE)} (or as environment variables)."
         )
     return tenant, client, secret
 
@@ -1647,6 +1713,132 @@ def upload_to_sharepoint(local_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# TERMINAL MULTIPLEXER (screen / tmux)  -- Linux only
+# ---------------------------------------------------------------------------
+# On the FIRST, interactive run the script can relaunch itself inside a
+# named screen session ("Netskope GenAI") so a long extraction survives the
+# SSH connection dropping. You can detach with Ctrl-A D and reattach later
+# with:
+#     screen -r "Netskope GenAI"
+#
+# Three guards keep this from causing trouble:
+#
+#   1. NOT under a scheduler. If stdin/stdout isn't a terminal -- which is
+#      how cron and systemd run things -- the wrapper is skipped entirely.
+#      Without this you'd accumulate one orphaned session per scheduled
+#      run, and cron jobs would appear to "succeed" instantly while the
+#      real work happened invisibly elsewhere.
+#   2. NOT already inside one. STY/TMUX are set inside a session; the
+#      NETSKOPE_IN_SCREEN marker covers the relaunch itself. Together they
+#      make infinite re-spawning impossible.
+#   3. NOT if the binary is missing. RHEL 9 does not ship `screen` in the
+#      base repos (it moved to EPEL), so tmux is used as a fallback and a
+#      plain foreground run is the last resort.
+# ---------------------------------------------------------------------------
+
+SCREEN_ENABLED: bool = env_bool("USE_SCREEN", True)
+SCREEN_NAME: str = env_str("SCREEN_NAME", "Netskope GenAI")
+
+# "auto" tries screen then tmux; force one with "screen" or "tmux";
+# "none" disables the wrapper the same as USE_SCREEN=false.
+SCREEN_TOOL: str = env_str("SCREEN_TOOL", "auto").lower()
+
+# Guard variable set on the relaunched child.
+IN_SCREEN_MARKER: str = "NETSKOPE_IN_SCREEN"
+
+
+def running_interactively() -> bool:
+    """
+    True only when a human is at the terminal. cron, systemd, Task
+    Scheduler and CI all fail this check, which is exactly what we want --
+    the screen wrapper must never engage for a scheduled run.
+    """
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def already_in_session() -> bool:
+    """True if we're inside screen/tmux, or are the relaunched child."""
+    return bool(
+        os.environ.get(IN_SCREEN_MARKER)
+        or os.environ.get("STY")       # set by screen
+        or os.environ.get("TMUX")      # set by tmux
+    )
+
+
+def pick_multiplexer() -> Optional[str]:
+    """Return the path to screen or tmux, honouring SCREEN_TOOL."""
+    if SCREEN_TOOL in ("none", "off", "false"):
+        return None
+    order = {
+        "screen": ["screen"],
+        "tmux": ["tmux"],
+    }.get(SCREEN_TOOL, ["screen", "tmux"])
+    for tool in order:
+        path = shutil.which(tool)
+        if path:
+            return path
+    return None
+
+
+def relaunch_in_session() -> bool:
+    """
+    Re-run this script inside a named screen/tmux session and attach to it.
+
+    Returns True if the process was handed off (the caller should exit),
+    False if we should just carry on in the foreground.
+    """
+    if not SCREEN_ENABLED or os.name != "posix":
+        return False
+    if already_in_session() or not running_interactively():
+        return False
+
+    tool_path = pick_multiplexer()
+    if not tool_path:
+        print("Note: neither 'screen' nor 'tmux' found -- running in the "
+              "foreground.\n"
+              "      On RHEL 9:  sudo dnf install -y tmux\n"
+              "      (screen lives in EPEL:  sudo dnf install -y epel-release "
+              "screen)\n")
+        return False
+
+    tool = os.path.basename(tool_path)
+    python = sys.executable or "python3"
+    script = os.path.abspath(__file__)
+    args = [a for a in sys.argv[1:]]
+
+    child_env = dict(os.environ)
+    child_env[IN_SCREEN_MARKER] = "1"
+
+    if tool == "screen":
+        # -S names it, -m forces a new session even if one exists.
+        command = [tool_path, "-S", SCREEN_NAME, "-m", python, script] + args
+        reattach = f'screen -r "{SCREEN_NAME}"'
+        detach_keys = "Ctrl-A then D"
+    else:
+        command = [tool_path, "new-session", "-s", SCREEN_NAME,
+                   python, script] + args
+        reattach = f'tmux attach -t "{SCREEN_NAME}"'
+        detach_keys = "Ctrl-B then D"
+
+    print(f"Starting inside {tool} session: {SCREEN_NAME}")
+    print(f"  detach   : {detach_keys}")
+    print(f"  reattach : {reattach}")
+    print()
+
+    try:
+        completed = subprocess.run(command, env=child_env)
+        return True if completed.returncode is not None else False
+    except FileNotFoundError:
+        return False
+    except Exception as exc:
+        print(f"Could not start {tool} ({exc}) -- running in the foreground.")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # RUN STATUS (used by --check)
 # ---------------------------------------------------------------------------
 # Each export writes a small JSON status file recording what happened for
@@ -1874,6 +2066,7 @@ def main() -> int:
         return finish(3, started, run_id)
 
     flat_rows = [flatten_record(r) for r in records]
+    resolve_byte_aliases(flat_rows)
     discovered = discover_columns(flat_rows)
     raw_row_count = len(flat_rows)
     flat_rows = dedupe_rows(flat_rows)
@@ -1962,5 +2155,12 @@ if __name__ == "__main__":
     if "--grant-help" in sys.argv:
         print_grant_help()
         sys.exit(0)
+
+    # Interactive first run: hand off into a named screen/tmux session so
+    # the job survives a dropped SSH connection. Silently skipped under
+    # cron/systemd, and when --no-screen is passed.
+    if "--no-screen" not in sys.argv and relaunch_in_session():
+        sys.exit(0)
+
     # Exit code lets Task Scheduler / cron flag a failed run.
     sys.exit(main())
