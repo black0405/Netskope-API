@@ -278,6 +278,12 @@ function makeSample(){
 
 /* ---- CSV loading -------------------------------------------------------- */
 function parseCSV(text){
+  // Excel-friendly: strip the UTF-8 BOM Excel prepends, and detect
+  // semicolon-delimited files (Excel's CSV format on many EU locales).
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  const nl = text.indexOf('\n');
+  const firstLine = nl === -1 ? text : text.slice(0, nl);
+  const delim = (firstLine.match(/;/g)||[]).length > (firstLine.match(/,/g)||[]).length ? ';' : ',';
   const rows = []; let row = [], cur = '', inQ = false;
   for (let i = 0; i < text.length; i++){
     const c = text[i];
@@ -285,7 +291,7 @@ function parseCSV(text){
       if (c === '"'){ if (text[i+1] === '"'){ cur += '"'; i++; } else inQ = false; }
       else cur += c;
     } else if (c === '"') inQ = true;
-    else if (c === ','){ row.push(cur); cur = ''; }
+    else if (c === delim){ row.push(cur); cur = ''; }
     else if (c === '\n' || c === '\r'){
       if (c === '\r' && text[i+1] === '\n') i++;
       row.push(cur); cur = '';
@@ -294,7 +300,7 @@ function parseCSV(text){
     } else cur += c;
   }
   if (cur !== '' || row.length){ row.push(cur); if (row.length > 1 || row[0] !== '') rows.push(row); }
-  return rows;
+  return { table: rows, delim };
 }
 
 const HEADER_MAP = {
@@ -341,14 +347,20 @@ function deriveMonth(dateStr){
 }
 
 function rowsFromCSV(text){
-  const table = parseCSV(text);
+  const { table, delim } = parseCSV(text);
   if (!table.length) return [];
   const idx = mapHeaders(table[0]);
   if (idx.app === undefined || idx.user === undefined) return null;   // not a recognised export
   const out = [];
   for (let r = 1; r < table.length; r++){
     const c = table[r];
-    const num = (i) => { const v = parseFloat(String(c[i]??'').replace(/,/g,'')); return isNaN(v) ? 0 : v; };
+    // In semicolon-delimited (EU locale) files a comma is the decimal mark,
+    // not a thousands separator.
+    const num = (i) => {
+      let s = String(c[i]??'');
+      s = delim === ';' ? s.replace(/\./g,'').replace(',', '.') : s.replace(/,/g,'');
+      const v = parseFloat(s); return isNaN(v) ? 0 : v;
+    };
     const [monthKey, monthLabel] = deriveMonth(idx.date !== undefined ? c[idx.date] : '');
     const acts = {};
     if (idx.activity !== undefined && c[idx.activity]){
@@ -369,6 +381,11 @@ function rowsFromCSV(text){
 }
 
 async function loadFiles(fileList){
+  const xlsx = [...fileList].filter(f => /\.xlsx?$/i.test(f.name));
+  if (xlsx.length){
+    alert('Excel workbooks are not supported directly: ' + xlsx.map(f => f.name).join(', ') +
+      '\nIn Excel use File > Save As > "CSV UTF-8 (Comma delimited)" and load that file.');
+  }
   const files = [...fileList].filter(f => /\.csv$/i.test(f.name) || f.type === 'text/csv');
   if (!files.length) return;
   const all = []; const bad = [];
