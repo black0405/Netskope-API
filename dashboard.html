@@ -62,6 +62,7 @@
   .notice.loadlog div { padding: 1px 0; }
   .notice.loadlog .ok { color: var(--ink-2); }
   .notice.loadlog .bad { color: #fab219; }
+  .notice.loadlog progress { width: 100%; height: 6px; accent-color: var(--accent); }
   .filters {
     display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
     padding: 10px 14px; margin-bottom: 14px;
@@ -395,23 +396,34 @@ async function loadFiles(fileList){
   // contexts, so every outcome is reported in the #loadStatus panel instead.
   const lines = [];
   const all = []; let ok = 0;
-  for (const f of [...fileList]){
+  const files = [...fileList];
+  const box0 = document.getElementById('loadStatus');
+  const bar = document.createElement('progress'); bar.max = files.length; bar.value = 0;
+  const lbl = document.createElement('div');
+  box0.hidden = false; box0.replaceChildren(bar, lbl);
+  for (const f of files){
+    lbl.textContent = `Loading ${f.name} (${bar.value + 1} of ${files.length})…`;
+    // yield one tick so the bar paints before the synchronous parse blocks the thread
+    await new Promise(r => setTimeout(r));
     if (/\.xlsx?$/i.test(f.name)){
       lines.push(['bad', f.name + ' — Excel workbook, not a CSV. In Excel: File › Save As › "CSV UTF-8 (Comma delimited)", then load that file.']);
-      continue;
+      bar.value++; continue;
     }
     if (!(/\.csv$/i.test(f.name) || f.type === 'text/csv' || f.type === 'application/vnd.ms-excel')){
       lines.push(['bad', f.name + ' — not a .csv file, skipped.']);
-      continue;
+      bar.value++; continue;
     }
     let res;
     try { res = rowsFromCSV(await f.text()); }
     catch (e) { res = { rows: null, error: 'could not read file (' + e.message + ')' }; }
+    bar.value++;
     if (!res.rows){ lines.push(['bad', f.name + ' — skipped: ' + res.error]); continue; }
     if (!res.rows.length){ lines.push(['bad', f.name + ' — has headers but no data rows, skipped.']); continue; }
     all.push(...res.rows); ok++;
     lines.push(['ok', f.name + ' — loaded ' + res.rows.length.toLocaleString('en-US') + ' rows.']);
   }
+  lbl.textContent = 'Rendering…';
+  await new Promise(r => setTimeout(r));
   const box = document.getElementById('loadStatus');
   box.hidden = !lines.length;
   box.innerHTML = lines.map(([cls, msg]) => `<div class="${cls}">${cls === 'ok' ? '✓' : '✕'} ${esc(msg)}</div>`).join('');
