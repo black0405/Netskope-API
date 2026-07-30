@@ -218,17 +218,27 @@ const ZONE_TOKENS = ['SAZ','NAZ','MAZ','GHQ','EUR','APAC','AFR','AMER','EMEA','A
 const MB_PER_GB = 1024;
 const $ = (s) => document.querySelector(s);
 
+/* Rows are never stored: every record folds into a (zone, month) aggregate
+   cell at ingest time, so memory scales with unique users and app names —
+   not with row count. Tens of millions of rows are fine. */
 const state = {
-  rows: [],            // {user, app, zone, monthKey, monthLabel, gb, gbUp, gbDown, acts:{name:count}}
+  cells: new Map(),      // "zone\u0000monthKey" -> {zone, monthKey, users:Set, gb, gbUp, gbDown, records, apps:Map, acts:Map}
+  monthLabels: new Map(),// monthKey -> display label
+  rowsTotal: 0,
   source: 'none',
   files: 0,
   zone: 'all',
   month: 'all',
   zoneOrder: [],       // frozen at load — color follows the entity
   appSlots: new Map(), // app -> series color, frozen at load
-  hasActivity: true,
+  hasActivity: false,
   view: {},            // cardId -> 'chart' | 'table'
 };
+
+function clearData(){
+  state.cells = new Map(); state.monthLabels = new Map();
+  state.rowsTotal = 0; state.files = 0; state.source = 'none'; state.hasActivity = false;
+}
 
 /* ---- formatting --------------------------------------------------------- */
 function fmtInt(n){ return n.toLocaleString('en-US'); }
@@ -261,42 +271,134 @@ function cheer(){
   }
 }
 
-/* ---- CSV loading -------------------------------------------------------- */
-function parseCSV(text){
-  // Excel-friendly: strip the UTF-8 BOM Excel prepends, and detect
-  // semicolon-delimited files (Excel's CSV format on many EU locales).
-  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-  const nl = text.indexOf('\n');
-  const firstLine = nl === -1 ? text : text.slice(0, nl);
-  const delim = (firstLine.match(/;/g)||[]).length > (firstLine.match(/,/g)||[]).length ? ';' : ',';
-  const rows = []; let row = [], cur = '', inQ = false;
-  for (let i = 0; i < text.length; i++){
-    const c = text[i];
-    if (inQ){
-      if (c === '"'){ if (text[i+1] === '"'){ cur += '"'; i++; } else inQ = false; }
-      else cur += c;
-    } else if (c === '"') inQ = true;
-    else if (c === delim){ row.push(cur); cur = ''; }
-    else if (c === '\n' || c === '\r'){
-      if (c === '\r' && text[i+1] === '\n') i++;
-      row.push(cur); cur = '';
-      if (row.length > 1 || row[0] !== '') rows.push(row);
-      row = [];
-    } else cur += c;
+/* ---- aggregate store ----------------------------------------------------- */
+function cellFor(zone, monthKey, monthLabel){
+  const k = zone + '\u0000' + monthKey;
+  let c = state.cells.get(k);
+  if (!c){
+    c = { zone, monthKey, users: new Set(), gb: 0, gbUp: 0, gbDown: 0,
+          records: 0, apps: new Map(), acts: new Map() };
+    state.cells.set(k, c);
   }
-  if (cur !== '' || row.length){ row.push(cur); if (row.length > 1 || row[0] !== '') rows.push(row); }
-  return { table: rows, delim };
+  if (!state.monthLabels.has(monthKey)) state.monthLabels.set(monthKey, monthLabel);
+  return c;
+}
+
+/* ---- CSV loading (streamed — files are never held in memory whole) ------ */
+function parseLine(line, delim){
+  const out = []; let cur = '', inQ = false;
+  for (let i = 0; i < line.length; i++){
+    const ch = line[i];
+    if (inQ){
+      if (ch === '"'){ if (line[i+1] === '"'){ cur += '"'; i++; } else inQ = false; }
+      else cur += ch;
+    } else if (ch === '"') inQ = true;
+    else if (ch === delim){ out.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+/* Read the file as a byte stream: detect the header, then fold every data
+   row straight into the aggregate cells. Returns the number of rows read.
+   Throws {error} on an unusable header. onBytes reports raw progress. */
+async function ingestFile(file, onBytes){
+  const reader = file.stream().getReader();
+  const dec = new TextDecoder('utf-8');
+  let pre = '', delim = ',', idx = null;
+  let cur = '', row = [], inQ = false, skipLF = false, rows = 0;
+
+  const num = (s) => {
+    s = delim === ';' ? s.replace(/\./g,'').replace(',', '.') : s.replace(/,/g,'');
+    const v = parseFloat(s); return isNaN(v) ? 0 : v;
+  };
+  const endRow = () => {
+    if (row.length === 1 && row[0] === ''){ row = []; return; }
+    const c = row; row = [];
+    const [monthKey, monthLabel] = deriveMonth(idx.date !== undefined ? c[idx.date] : '');
+    const down = idx.down !== undefined ? num(String(c[idx.down] ?? ''))/MB_PER_GB : 0;
+    const up   = idx.up   !== undefined ? num(String(c[idx.up] ?? ''))/MB_PER_GB : 0;
+    let total  = idx.total!== undefined ? num(String(c[idx.total] ?? ''))/MB_PER_GB : 0;
+    if (!total) total = down + up;
+    const zone = deriveZone(idx.ou !== undefined ? c[idx.ou] : '',
+                            idx.group !== undefined ? c[idx.group] : '');
+    const cell = cellFor(zone, monthKey, monthLabel);
+    cell.users.add(c[idx.user] || 'unknown');
+    cell.gb += total; cell.gbUp += up; cell.gbDown += down; cell.records++;
+    const app = c[idx.app] || 'Unknown';
+    let a = cell.apps.get(app);
+    if (!a){ a = { records: 0, gb: 0, gbUp: 0 }; cell.apps.set(app, a); }
+    a.records++; a.gb += total; a.gbUp += up;
+    if (idx.activity !== undefined && c[idx.activity]){
+      for (const name of String(c[idx.activity]).split('|')){
+        const t = name.trim();
+        if (t){ cell.acts.set(t, (cell.acts.get(t)||0) + 1); state.hasActivity = true; }
+      }
+    }
+    rows++; state.rowsTotal++;
+  };
+
+  const feed = (text) => {
+    for (let i = 0; i < text.length; i++){
+      const ch = text[i];
+      if (skipLF){ skipLF = false; if (ch === '\n') continue; }
+      if (inQ){
+        if (ch === '"'){ if (text[i+1] === '"'){ cur += '"'; i++; } else inQ = false; }
+        else cur += ch;
+      } else if (ch === '"') inQ = true;
+      else if (ch === delim){ row.push(cur); cur = ''; }
+      else if (ch === '\n' || ch === '\r'){
+        if (ch === '\r') skipLF = true;
+        row.push(cur); cur = '';
+        endRow();
+      } else cur += ch;
+    }
+  };
+
+  for (;;){
+    const { done, value } = await reader.read();
+    const text = done ? dec.decode() : dec.decode(value, { stream: true });
+    if (idx === null && text){
+      // still hunting for the header line (assumed to contain no quoted newlines)
+      pre += text;
+      const nl = pre.indexOf('\n');
+      if (nl === -1){ if (!done){ if (value) onBytes(value.byteLength); continue; } }
+      let head = (nl === -1 ? pre : pre.slice(0, nl)).replace(/\r$/, '');
+      if (head.charCodeAt(0) === 0xFEFF) head = head.slice(1);
+      delim = (head.match(/;/g)||[]).length > (head.match(/,/g)||[]).length ? ';' : ',';
+      idx = mapHeaders(parseLine(head, delim));
+      if (idx.app === undefined || idx.user === undefined){
+        reader.cancel();
+        const miss = [idx.app === undefined ? '"Application"' : null,
+                      idx.user === undefined ? '"User"' : null].filter(Boolean).join(' and ');
+        throw { error: 'missing required column ' + miss +
+          ' — headers found: ' + parseLine(head, delim).map(h => h.trim()).filter(Boolean).join(', ') };
+      }
+      if (nl !== -1) feed(pre.slice(nl + 1));
+      pre = '';
+    } else if (text){
+      feed(text);
+    }
+    if (value) onBytes(value.byteLength);
+    if (done) break;
+  }
+  if (cur !== '' || row.length){ row.push(cur); endRow(); }
+  return rows;
 }
 
 const HEADER_MAP = {
   app: ['application','app'],
   user: ['user'],
   date: ['event date','timestamp','date'],
-  group: ['user group','usergroup'],
+  group: ['user group','usergroup','department'],
   ou: ['organization unit','organization_unit','org unit'],
-  total: ['sum - total bytes (mb)','numbytes','total bytes (mb)','total bytes'],
-  down: ['sum - bytes downloaded (mb)','server_bytes','bytes downloaded (mb)'],
-  up: ['sum - bytes uploaded (mb)','client_bytes','bytes uploaded (mb)'],
+  total: ['sum - total bytes (mb)','numbytes','total bytes (mb)','total bytes',
+          'sum - file size (mb)','file size (mb)','file size'],
+  down: ['sum - bytes downloaded (mb)','server_bytes','bytes downloaded (mb)',
+         'bytes download','bytes downloaded','download bytes'],
+  up: ['sum - bytes uploaded (mb)','client_bytes','bytes uploaded (mb)',
+       'bytes upload','bytes uploaded','upload bytes'],
   activity: ['activity','action'],
 };
 
@@ -331,84 +433,48 @@ function deriveMonth(dateStr){
   return [y + '-' + String(m).padStart(2,'0'), label];
 }
 
-function rowsFromCSV(text){
-  const { table, delim } = parseCSV(text);
-  if (!table.length) return { rows: null, error: 'file is empty' };
-  const idx = mapHeaders(table[0]);
-  if (idx.app === undefined || idx.user === undefined){
-    const miss = [idx.app === undefined ? '"Application"' : null,
-                  idx.user === undefined ? '"User"' : null].filter(Boolean).join(' and ');
-    return { rows: null, error: 'missing required column ' + miss +
-      ' — headers found: ' + table[0].map(h => h.trim()).filter(Boolean).join(', ') };
-  }
-  const out = [];
-  for (let r = 1; r < table.length; r++){
-    const c = table[r];
-    // In semicolon-delimited (EU locale) files a comma is the decimal mark,
-    // not a thousands separator.
-    const num = (i) => {
-      let s = String(c[i]??'');
-      s = delim === ';' ? s.replace(/\./g,'').replace(',', '.') : s.replace(/,/g,'');
-      const v = parseFloat(s); return isNaN(v) ? 0 : v;
-    };
-    const [monthKey, monthLabel] = deriveMonth(idx.date !== undefined ? c[idx.date] : '');
-    const acts = {};
-    if (idx.activity !== undefined && c[idx.activity]){
-      for (const a of String(c[idx.activity]).split('|').map(s => s.trim()).filter(Boolean)) acts[a] = (acts[a]||0) + 1;
-    }
-    const down = idx.down !== undefined ? num(idx.down)/MB_PER_GB : 0;
-    const up   = idx.up   !== undefined ? num(idx.up)/MB_PER_GB : 0;
-    let total  = idx.total!== undefined ? num(idx.total)/MB_PER_GB : 0;
-    if (!total) total = down + up;
-    out.push({
-      user: c[idx.user] || 'unknown',
-      app:  c[idx.app]  || 'Unknown',
-      zone: deriveZone(idx.ou !== undefined ? c[idx.ou] : '', idx.group !== undefined ? c[idx.group] : ''),
-      monthKey, monthLabel, gb: total, gbUp: up, gbDown: down, acts,
-    });
-  }
-  return { rows: out };
-}
-
 async function loadFiles(fileList){
   // No alert() anywhere in this path — popups are suppressed in embedded
   // contexts, so every outcome is reported in the #loadStatus panel instead.
   const lines = [];
-  const all = []; let ok = 0;
-  const files = [...fileList];
-  const box0 = document.getElementById('loadStatus');
-  const bar = document.createElement('progress'); bar.max = files.length; bar.value = 0;
-  const lbl = document.createElement('div');
-  box0.hidden = false; box0.replaceChildren(bar, lbl);
-  for (const f of files){
-    lbl.textContent = `Loading ${f.name} (${bar.value + 1} of ${files.length})…`;
-    // yield one tick so the bar paints before the synchronous parse blocks the thread
-    await new Promise(r => setTimeout(r));
+  const csvs = [];
+  for (const f of [...fileList]){
     if (/\.xlsx?$/i.test(f.name)){
       lines.push(['bad', f.name + ' — Excel workbook, not a CSV. In Excel: File › Save As › "CSV UTF-8 (Comma delimited)", then load that file.']);
-      bar.value++; continue;
-    }
-    if (!(/\.csv$/i.test(f.name) || f.type === 'text/csv' || f.type === 'application/vnd.ms-excel')){
+    } else if (!(/\.csv$/i.test(f.name) || f.type === 'text/csv' || f.type === 'application/vnd.ms-excel')){
       lines.push(['bad', f.name + ' — not a .csv file, skipped.']);
-      bar.value++; continue;
+    } else csvs.push(f);
+  }
+  const box = document.getElementById('loadStatus');
+  const bar = document.createElement('progress');
+  bar.max = csvs.reduce((s, f) => s + f.size, 0) || 1;
+  bar.value = 0;
+  const lbl = document.createElement('div');
+  box.hidden = false; box.replaceChildren(bar, lbl);
+
+  let ok = 0;
+  for (let i = 0; i < csvs.length; i++){
+    const f = csvs[i];
+    const base = `Loading ${f.name} (${i + 1} of ${csvs.length})`;
+    lbl.textContent = base + '…';
+    await new Promise(r => setTimeout(r));
+    try {
+      const n = await ingestFile(f, (bytes) => {
+        bar.value += bytes;
+        lbl.textContent = `${base} — ${Math.min(100, Math.round(bar.value / bar.max * 100))}%`;
+      });
+      if (!n){ lines.push(['bad', f.name + ' — has headers but no data rows, skipped.']); continue; }
+      ok++;
+      lines.push(['ok', f.name + ' — loaded ' + n.toLocaleString('en-US') + ' rows.']);
+    } catch (e) {
+      lines.push(['bad', f.name + ' — skipped: ' + (e.error || 'could not read file (' + e.message + ')')]);
     }
-    let res;
-    try { res = rowsFromCSV(await f.text()); }
-    catch (e) { res = { rows: null, error: 'could not read file (' + e.message + ')' }; }
-    bar.value++;
-    if (!res.rows){ lines.push(['bad', f.name + ' — skipped: ' + res.error]); continue; }
-    if (!res.rows.length){ lines.push(['bad', f.name + ' — has headers but no data rows, skipped.']); continue; }
-    all.push(...res.rows); ok++;
-    lines.push(['ok', f.name + ' — loaded ' + res.rows.length.toLocaleString('en-US') + ' rows.']);
   }
   lbl.textContent = 'Rendering…';
   await new Promise(r => setTimeout(r));
-  const box = document.getElementById('loadStatus');
   box.hidden = !lines.length;
   box.innerHTML = lines.map(([cls, msg]) => `<div class="${cls}">${cls === 'ok' ? '✓' : '✕'} ${esc(msg)}</div>`).join('');
-  if (!all.length) return;
-  if (state.source !== 'files'){ state.rows = []; state.files = 0; }
-  state.rows.push(...all);
+  if (!ok) return;
   state.files += ok;
   state.source = 'files';
   initData();
@@ -417,23 +483,28 @@ async function loadFiles(fileList){
 
 /* ---- data init (freeze colors, fill filters) ---------------------------- */
 function initData(){
-  const rows = state.rows;
-  state.hasActivity = rows.some(r => Object.keys(r.acts).length);
-
-  const known = ZONE_TOKENS.filter(z => rows.some(r => r.zone === z));
-  const rest = [...new Set(rows.map(r => r.zone))].filter(z => !known.includes(z)).sort();
+  const zones = new Set();
+  const appTotals = new Map();  // app -> [gbUp, gb] for slot ranking
+  for (const c of state.cells.values()){
+    zones.add(c.zone);
+    for (const [app, a] of c.apps){
+      let t = appTotals.get(app);
+      if (!t){ t = [0, 0]; appTotals.set(app, t); }
+      t[0] += a.gbUp; t[1] += a.gb;
+    }
+  }
+  const known = ZONE_TOKENS.filter(z => zones.has(z));
+  const rest = [...zones].filter(z => !known.includes(z)).sort();
   state.zoneOrder = [...known, ...rest];
 
-  const appTotals = new Map();
-  for (const r of rows) appTotals.set(r.app, (appTotals.get(r.app)||0) + r.gbUp);
-  const ranked = [...appTotals.entries()].sort((a,b) => b[1]-a[1]).map(e => e[0]);
+  // Rank by uploaded GB, falling back to total GB when uploads are all zero.
+  const ranked = [...appTotals.entries()]
+    .sort((a,b) => (b[1][0] - a[1][0]) || (b[1][1] - a[1][1])).map(e => e[0]);
   state.appSlots = new Map(ranked.slice(0, 6).map((app,i) => [app, SERIES[i]]));
 
   state.zone = 'all'; state.month = 'all';
   fillSelect($('#fZone'), ['All zones', ...state.zoneOrder]);
-  const months = [...new Map(rows.map(r => [r.monthKey, r.monthLabel])).entries()]
-    .sort((a,b) => a[0] < b[0] ? -1 : 1);
-  state.months = months;
+  const months = [...state.monthLabels.entries()].sort((a,b) => a[0] < b[0] ? -1 : 1);
   fillSelect($('#fMonth'), ['All months', ...months.map(m => m[1])]);
 
   render();
@@ -444,11 +515,11 @@ function fillSelect(sel, labels){
   sel.value = 'all';
 }
 
-/* ---- aggregation -------------------------------------------------------- */
-function filtered(){
-  return state.rows.filter(r =>
-    (state.zone === 'all' || r.zone === state.zone) &&
-    (state.month === 'all' || r.monthLabel === state.month));
+/* ---- aggregation: pick the cells the current filter selects -------------- */
+function selectedCells(){
+  return [...state.cells.values()].filter(c =>
+    (state.zone === 'all' || c.zone === state.zone) &&
+    (state.month === 'all' || state.monthLabels.get(c.monthKey) === state.month));
 }
 
 /* ---- svg helpers -------------------------------------------------------- */
@@ -615,7 +686,31 @@ function donutChart(body, data, opts){
 
 /* ---- render ------------------------------------------------------------- */
 function render(){
-  const rows = filtered();
+  const cells = selectedCells();
+
+  /* merge the selected cells into the per-chart maps */
+  let records = 0, actEvents = 0;
+  const userUnion = new Set();
+  const zoneUsers = new Map(), zoneGB = new Map(), appRecords = new Map(),
+        appUpload = new Map(), appGB = new Map(), actCount = new Map();
+  const zoneUserSets = new Map();
+  for (const c of cells){
+    records += c.records;
+    let zs = zoneUserSets.get(c.zone);
+    if (!zs){ zs = new Set(); zoneUserSets.set(c.zone, zs); }
+    for (const u of c.users){ zs.add(u); userUnion.add(u); }
+    zoneGB.set(c.zone, (zoneGB.get(c.zone)||0) + c.gb);
+    for (const [app, a] of c.apps){
+      appRecords.set(app, (appRecords.get(app)||0) + a.records);
+      appUpload.set(app, (appUpload.get(app)||0) + a.gbUp);
+      appGB.set(app, (appGB.get(app)||0) + a.gb);
+    }
+    for (const [k,v] of c.acts){ actCount.set(k, (actCount.get(k)||0) + v); actEvents += v; }
+  }
+  for (const [z,s] of zoneUserSets) zoneUsers.set(z, s.size);
+  const rows = { length: records };               // chart code below reads rows.length
+  const users = { size: userUnion.size };
+  const apps = { size: appRecords.size };
 
   /* source notice + counts */
   const n = $('#srcNotice');
@@ -623,36 +718,17 @@ function render(){
     n.innerHTML = `<b>No data loaded yet</b> — click <b>Load CSV</b> (or drag &amp; drop) one or more
       export files. Every chart fills in as soon as a file loads.`;
   } else {
-    n.innerHTML = `<b>${state.files} file${state.files>1?'s':''} loaded</b> — ${fmtInt(state.rows.length)} rows.
+    n.innerHTML = `<b>${state.files} file${state.files>1?'s':''} loaded</b> — ${fmtInt(state.rowsTotal)} rows.
       Load more files to append additional days.`;
   }
-  $('#rowCount').textContent = fmtInt(rows.length) + ' of ' + fmtInt(state.rows.length) + ' rows in view';
+  $('#rowCount').textContent = fmtInt(records) + ' of ' + fmtInt(state.rowsTotal) + ' rows in view';
 
   /* KPIs */
-  const users = new Set(rows.map(r => r.user));
-  const apps = new Set(rows.map(r => r.app));
-  let actEvents = 0;
-  for (const r of rows) for (const k in r.acts) actEvents += r.acts[k];
   $('#kUsers').textContent = fmtCompact(users.size);
-  $('#kRecords').textContent = fmtCompact(rows.length);
+  $('#kRecords').textContent = fmtCompact(records);
   $('#kApps').textContent = fmtCompact(apps.size);
-  $('#kActs').textContent = state.hasActivity ? fmtCompact(actEvents) : (rows.length ? '—' : '0');
-  $('#kActsSub').textContent = (state.hasActivity || !rows.length) ? 'Upload · Download · Post · …' : 'no Activity column in this export';
-
-  /* aggregates */
-  const zoneUsers = new Map(), zoneGB = new Map(), appRecords = new Map(),
-        appUpload = new Map(), appGB = new Map(), actCount = new Map();
-  const zoneUserSets = new Map();
-  for (const r of rows){
-    if (!zoneUserSets.has(r.zone)) zoneUserSets.set(r.zone, new Set());
-    zoneUserSets.get(r.zone).add(r.user);
-    zoneGB.set(r.zone, (zoneGB.get(r.zone)||0) + r.gb);
-    appRecords.set(r.app, (appRecords.get(r.app)||0) + 1);
-    appUpload.set(r.app, (appUpload.get(r.app)||0) + r.gbUp);
-    appGB.set(r.app, (appGB.get(r.app)||0) + r.gb);
-    for (const k in r.acts) actCount.set(k, (actCount.get(k)||0) + r.acts[k]);
-  }
-  for (const [z,s] of zoneUserSets) zoneUsers.set(z, s.size);
+  $('#kActs').textContent = state.hasActivity ? fmtCompact(actEvents) : (records ? '—' : '0');
+  $('#kActsSub').textContent = (state.hasActivity || !records) ? 'Upload · Download · Post · …' : 'no Activity column in this export';
   const zonesInView = state.zoneOrder.filter(z => zoneUsers.has(z));
   // Only the first 8 zones get a hue (fixed slots, color follows the entity);
   // any zone past the palette folds into "Other" on the donut — never cycle hues.
@@ -825,7 +901,7 @@ $('#fMonth').addEventListener('change', e => { state.month = e.target.value; ren
 $('#fReset').addEventListener('click', () => { state.zone = 'all'; state.month = 'all';
   $('#fZone').value = 'all'; $('#fMonth').value = 'all'; render(); });
 $('#fileIn').addEventListener('change', e => loadFiles(e.target.files));
-$('#resetData').addEventListener('click', () => { state.rows = []; state.source = 'none'; state.files = 0; $('#loadStatus').hidden = true; initData(); });
+$('#resetData').addEventListener('click', () => { clearData(); $('#loadStatus').hidden = true; initData(); });
 $('#dlJpeg').addEventListener('click', downloadJPEG);
 
 let dragDepth = 0;
