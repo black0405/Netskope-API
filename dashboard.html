@@ -211,8 +211,71 @@ const BAR    = getCss('--bar');
 const OTHER  = getCss('--other');
 function getCss(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
 
-/* Zone codes recognised inside "Organization Unit" / "User Group".
-   Extend this list if your OU strings use different region tokens. */
+/* ---- Zone mapping --------------------------------------------------------
+   First matching rule wins. field: which CSV column to test — 'group'
+   (User Group / department), 'ou' (Organization Unit), 'access' (Access
+   Method). Matching is case-insensitive substring, so multi-valued
+   usergroup cells (several AD groups joined in one field) still match. */
+const ZONE_RULES = [
+  { zone: 'APAC IN', field: 'group', needles: [
+    'AP1.OFC.LOC/India/Groups/IN_Global_netskope_AP1User',
+    'india.asia.gcn.local/IN/Administrative/Groups - Security/IN_Global_netskope_Alluser',
+    'ONE.OFC.LOC/Zone-ABI Global/Managed Objects/Managed Groups/SONEG-Netskope-ABI-GOA Team' ] },
+  { zone: 'APAC VN', field: 'ou', needles: [ 'AP1.OFC.LOC/Vietnam/Users' ] },
+  { zone: 'APAC KR', field: 'group', needles: [ 'ob.co.kr/OB/Groups/User/manual/S001' ] },
+  { zone: 'APAC CN', field: 'access', needles: [ 'Local Proxy' ] },
+  { zone: 'EUR', field: 'group', needles: [
+    'we.interbrew.net/ABI-IBS-EU-EuropeDC1 (Amsterdam)/Groups/User Groups/Applications/G-SWED-Netskope_Users',
+    'rus.efesmoscow/GFolders/Netskope/G-SRUSG-NetskopeUsers_Exeptions-RUK',
+    'rus.efesmoscow/GFolders/Netskope/G-SRUSG-NetskopeUsers-UA',
+    'we.interbrew.net/ABI-IBS-EU-EuropeDC1 (Amsterdam)/Groups/User Groups/Applications/G-SWEG-DE-Netskope_Users',
+    'we.interbrew.net/ABI-IBS-EU-EuropeDC1 (Amsterdam)/Groups/User Groups/Applications/SONED-ABI-EUR-Netskope-DigitalSolutions-Users',
+    'we.interbrew.net/ABI-IBS-EU-EuropeDC1 (Amsterdam)/Groups/User Groups/Applications/G-SWEG-EUR-NPA-VPN',
+    'rus.efesmoscow/GFolders/Netskope/G-SRUSG-NetskopeUsers-RU',
+    'we.interbrew.net/ABI-IBS-EU-EuropeDC1 (Amsterdam)/Groups/User Groups/Applications/G-SWED-Netskope_UAT',
+    'ccc.europe.gcn.local/Applications/Netscope/G-NPA-Users',
+    'ccc.europe.gcn.local/Applications/Zscaler/G Users Proxy ZScaler',
+    'ccc.europe.gcn.local/Applications/Zscaler/G Users Proxy HyperCare_Netskope',
+    'we.interbrew.net/ABI-IBS-EU-EuropeDC1 (Amsterdam)/Groups/User Groups/Applications/G-SWEG-BE-Netskope_Users' ] },
+  { zone: 'AFR', field: 'group', needles: [
+    'beerdivision.africa.gcn.local/Groups/ZScaler Proxy/SG - AFR Proxy - Marketing Internet Access',
+    'beerdivision.africa.gcn.local/Groups/ZScaler Proxy/SG - AFR Proxy - Standard Internet Access',
+    'ONE.OFC.LOC/Zone-ABI Global/Managed Objects/Managed Groups/SONED-Workplace-MUstdinternetaccess',
+    'beerdivision.africa.gcn.local/Groups/ZScaler Proxy/SG - AFR Proxy - Hypercare Admin Only' ] },
+  { zone: 'GHQ', field: 'group', needles: [
+    'ONE.OFC.LOC/Zone-ABI Global/Managed Objects/Managed Groups/SONEG-NetskopePolicy-GHQ-AllUsers' ] },
+  { zone: 'MAZ', field: 'group', needles: [
+    'modelo.gmodelo.com.mx/Corporativo/Grupos/Diblo/GPO Groups/MAZ_Proxy_Mancom',
+    'modelo.gmodelo.com.mx/Corporativo/Grupos/Diblo/GPO Groups/MAZ_Proxy_Advanced',
+    'modelo.gmodelo.com.mx/Groups/Security/MAZ_Proxy_Service',
+    'modelo.gmodelo.com.mx/Corporativo/Grupos/Diblo/GPO Groups/MAZ_Proxy_Marketing',
+    'modelo.gmodelo.com.mx/Corporativo/Grupos/Diblo/GPO Groups/MAZ_Proxy_Basic' ] },
+  { zone: 'NAZ', field: 'group', needles: [
+    'abc.corp.anheuser-busch.com/Security Groups/Application Groups/NetSkope/APP ROLE-NAZ-Netskope_ABC',
+    'na.interbrew.net/Security Groups/Application Groups/Netskope/APP ROLE-NAZ-Netskope_NA',
+    'abpg.corp.anheuser-busch.com/Security Groups/Application Groups/Netskope/APP ROLE-NAZ-Netskope_ABPG',
+    'ONE.OFC.LOC/Zone-North America/Security Groups/Application Groups/Netskope/APP ROLE-NAZ-Netskope_ONE' ] },
+  { zone: 'SAZ', field: 'group', needles: [
+    'cbn.com.bo/Users/SLASG_Netskope_AllUsers_BO',
+    'cmqpnt.bue.bemberg.com.ar/Users/SLASG_Netskope_AllUsers_AR',
+    'cervepar.local/Users/SLASG_Netskope_AllUsers_PY',
+    'quinsacl.sgo.quilmes.cl/Users/SLASG_Netskope_AllUsers_CL',
+    'quinsauy.mvd.bemberg.com.uy/Users/SLASG_Netskope_AllUsers_UY',
+    'ONE.OFC.LOC/Zone-Latin America South/Managed Objects/Managed Groups/Netskope/SONEG_Netskope_AllUsers_LAS',
+    'la.interbrew.net/Corporativo/ADM_CENTRAL_AC/Service_Groups/SAZ_LAN_Netskope_Advanced',
+    'la.interbrew.net/Corporativo/ADM_CENTRAL_AC/Service_Groups/SAZ_LAN_Netskope_Intermediate' ] },
+];
+for (const r of ZONE_RULES) r.needles = r.needles.map(n => n.toLowerCase());
+
+/* Display / color order for the mapped zones (first 8 get palette slots). */
+const ZONE_ORDER = ['SAZ','NAZ','MAZ','GHQ','EUR','AFR','APAC IN','APAC VN','APAC KR','APAC CN'];
+
+/* Groups deliberately NOT mapped to any zone (e.g. Growth). Their text is
+   removed before the token fallback so a zone code inside the group name
+   (…-GHQ-…-Growth) cannot leak a wrong zone. */
+const ZONE_EXCLUDE = ['soneu-ghq-br-people-all-growth'];
+
+/* Fallback token detection for rows no rule matches. */
 const ZONE_TOKENS = ['SAZ','NAZ','MAZ','GHQ','EUR','APAC','AFR','AMER','EMEA','APJ','LATAM'];
 
 const MB_PER_GB = 1024;
@@ -322,7 +385,8 @@ async function ingestFile(file, onBytes){
     let total  = idx.total!== undefined ? num(String(c[idx.total] ?? ''))/MB_PER_GB : 0;
     if (!total) total = down + up;
     const zone = deriveZone(idx.ou !== undefined ? c[idx.ou] : '',
-                            idx.group !== undefined ? c[idx.group] : '');
+                            idx.group !== undefined ? c[idx.group] : '',
+                            idx.access !== undefined ? c[idx.access] : '');
     const cell = cellFor(zone, monthKey, monthLabel);
     cell.users.add(c[idx.user] || 'unknown');
     cell.gb += total; cell.gbUp += up; cell.gbDown += down; cell.records++;
@@ -400,6 +464,7 @@ const HEADER_MAP = {
   up: ['sum - bytes uploaded (mb)','client_bytes','bytes uploaded (mb)',
        'bytes upload','bytes uploaded','upload bytes'],
   activity: ['activity','action'],
+  access: ['access method','access_method'],
 };
 
 function mapHeaders(headerRow){
@@ -411,11 +476,19 @@ function mapHeaders(headerRow){
   return idx;
 }
 
-function deriveZone(ou, group){
-  const hay = ((ou||'') + ' ' + (group||'')).toUpperCase();
-  for (const z of ZONE_TOKENS){ if (new RegExp('\\b' + z + '\\b').test(hay)) return z; }
-  const seg = (ou||'').split(/[\/\\>|,;]+/).map(s => s.trim()).filter(Boolean);
-  return seg.length ? seg[0] : 'Unknown';
+function deriveZone(ou, group, access){
+  const fields = { ou: (ou||'').toLowerCase(), group: (group||'').toLowerCase(),
+                   access: (access||'').toLowerCase() };
+  for (const r of ZONE_RULES){
+    const hay = fields[r.field];
+    if (!hay) continue;
+    for (const n of r.needles) if (hay.includes(n)) return r.zone;
+  }
+  let hay2 = (fields.ou + ' ' + fields.group);
+  for (const x of ZONE_EXCLUDE) hay2 = hay2.split(x).join(' ');
+  hay2 = hay2.toUpperCase();
+  for (const z of ZONE_TOKENS){ if (new RegExp('\\b' + z + '\\b').test(hay2)) return z; }
+  return 'Unknown';
 }
 
 function deriveMonth(dateStr){
@@ -493,7 +566,7 @@ function initData(){
       t[0] += a.gbUp; t[1] += a.gb;
     }
   }
-  const known = ZONE_TOKENS.filter(z => zones.has(z));
+  const known = ZONE_ORDER.filter(z => zones.has(z));
   const rest = [...zones].filter(z => !known.includes(z)).sort();
   state.zoneOrder = [...known, ...rest];
 
