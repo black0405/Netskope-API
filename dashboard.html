@@ -58,6 +58,10 @@
     padding: 8px 14px; margin-bottom: 14px; font-size: 12.5px; color: var(--ink-3);
   }
   .notice b { color: var(--ink-2); font-weight: 600; }
+  .notice.loadlog { display: block; border-style: solid; border-color: rgba(240,177,0,0.45); }
+  .notice.loadlog div { padding: 1px 0; }
+  .notice.loadlog .ok { color: var(--ink-2); }
+  .notice.loadlog .bad { color: #fab219; }
   .filters {
     display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
     padding: 10px 14px; margin-bottom: 14px;
@@ -159,6 +163,7 @@
   </header>
 
   <div class="notice" id="srcNotice"></div>
+  <div class="notice loadlog" id="loadStatus" hidden data-noexport></div>
 
   <div class="filters" data-export-static>
     <label for="fZone">Zone</label>
@@ -348,9 +353,14 @@ function deriveMonth(dateStr){
 
 function rowsFromCSV(text){
   const { table, delim } = parseCSV(text);
-  if (!table.length) return [];
+  if (!table.length) return { rows: null, error: 'file is empty' };
   const idx = mapHeaders(table[0]);
-  if (idx.app === undefined || idx.user === undefined) return null;   // not a recognised export
+  if (idx.app === undefined || idx.user === undefined){
+    const miss = [idx.app === undefined ? '"Application"' : null,
+                  idx.user === undefined ? '"User"' : null].filter(Boolean).join(' and ');
+    return { rows: null, error: 'missing required column ' + miss +
+      ' — headers found: ' + table[0].map(h => h.trim()).filter(Boolean).join(', ') };
+  }
   const out = [];
   for (let r = 1; r < table.length; r++){
     const c = table[r];
@@ -377,27 +387,38 @@ function rowsFromCSV(text){
       monthKey, monthLabel, gb: total, gbUp: up, gbDown: down, acts,
     });
   }
-  return out;
+  return { rows: out };
 }
 
 async function loadFiles(fileList){
-  const xlsx = [...fileList].filter(f => /\.xlsx?$/i.test(f.name));
-  if (xlsx.length){
-    alert('Excel workbooks are not supported directly: ' + xlsx.map(f => f.name).join(', ') +
-      '\nIn Excel use File > Save As > "CSV UTF-8 (Comma delimited)" and load that file.');
+  // No alert() anywhere in this path — popups are suppressed in embedded
+  // contexts, so every outcome is reported in the #loadStatus panel instead.
+  const lines = [];
+  const all = []; let ok = 0;
+  for (const f of [...fileList]){
+    if (/\.xlsx?$/i.test(f.name)){
+      lines.push(['bad', f.name + ' — Excel workbook, not a CSV. In Excel: File › Save As › "CSV UTF-8 (Comma delimited)", then load that file.']);
+      continue;
+    }
+    if (!(/\.csv$/i.test(f.name) || f.type === 'text/csv' || f.type === 'application/vnd.ms-excel')){
+      lines.push(['bad', f.name + ' — not a .csv file, skipped.']);
+      continue;
+    }
+    let res;
+    try { res = rowsFromCSV(await f.text()); }
+    catch (e) { res = { rows: null, error: 'could not read file (' + e.message + ')' }; }
+    if (!res.rows){ lines.push(['bad', f.name + ' — skipped: ' + res.error]); continue; }
+    if (!res.rows.length){ lines.push(['bad', f.name + ' — has headers but no data rows, skipped.']); continue; }
+    all.push(...res.rows); ok++;
+    lines.push(['ok', f.name + ' — loaded ' + res.rows.length.toLocaleString('en-US') + ' rows.']);
   }
-  const files = [...fileList].filter(f => /\.csv$/i.test(f.name) || f.type === 'text/csv');
-  if (!files.length) return;
-  const all = []; const bad = [];
-  for (const f of files){
-    const rows = rowsFromCSV(await f.text());
-    if (rows === null) bad.push(f.name); else all.push(...rows);
-  }
-  if (bad.length) alert('Skipped (missing Application/User columns): ' + bad.join(', '));
+  const box = document.getElementById('loadStatus');
+  box.hidden = !lines.length;
+  box.innerHTML = lines.map(([cls, msg]) => `<div class="${cls}">${cls === 'ok' ? '✓' : '✕'} ${esc(msg)}</div>`).join('');
   if (!all.length) return;
   if (state.source !== 'files'){ state.rows = []; state.files = 0; }
   state.rows.push(...all);
-  state.files += files.length - bad.length;
+  state.files += ok;
   state.source = 'files';
   initData();
 }
@@ -767,8 +788,10 @@ async function downloadJPEG(){
     a.href = jpeg;
     a.click();
   } catch (err) {
-    alert('JPEG export failed in this browser: ' + err.message +
-      '\nTip: Chrome and Edge support this export; as a fallback use a full-page screenshot.');
+    const box = document.getElementById('loadStatus');
+    box.hidden = false;
+    box.innerHTML = `<div class="bad">✕ ${esc('JPEG export failed in this browser: ' + err.message +
+      ' — Chrome and Edge support this export; as a fallback use a full-page screenshot.')}</div>`;
   } finally {
     btn.disabled = false; btn.textContent = 'Download JPEG';
   }
@@ -810,7 +833,7 @@ $('#fMonth').addEventListener('change', e => { state.month = e.target.value; ren
 $('#fReset').addEventListener('click', () => { state.zone = 'all'; state.month = 'all';
   $('#fZone').value = 'all'; $('#fMonth').value = 'all'; render(); });
 $('#fileIn').addEventListener('change', e => loadFiles(e.target.files));
-$('#resetData').addEventListener('click', () => { state.rows = makeSample(); state.source = 'sample'; state.files = 0; initData(); });
+$('#resetData').addEventListener('click', () => { state.rows = makeSample(); state.source = 'sample'; state.files = 0; $('#loadStatus').hidden = true; initData(); });
 $('#dlJpeg').addEventListener('click', downloadJPEG);
 
 let dragDepth = 0;
