@@ -59,6 +59,7 @@
   }
   .notice b { color: var(--ink-2); font-weight: 600; }
   .notice.loadlog { display: block; border-style: solid; border-color: rgba(240,177,0,0.45); }
+  .notice.loadlog[hidden] { display: none; }
   .notice.loadlog div { padding: 1px 0; }
   .notice.loadlog .ok { color: var(--ink-2); }
   .notice.loadlog .bad { color: #fab219; }
@@ -158,7 +159,7 @@
     <div class="spacer"></div>
     <div class="actions" data-noexport>
       <span class="btn filebtn" tabindex="-1">Load CSV<input type="file" id="fileIn" accept=".csv,text/csv" multiple aria-label="Load Netskope export CSV files"></span>
-      <button class="btn" id="resetData" title="Discard loaded files and show sample data">Sample data</button>
+      <button class="btn" id="resetData" title="Discard all loaded files">Clear data</button>
       <button class="btn primary" id="dlJpeg">Download JPEG</button>
     </div>
   </header>
@@ -219,7 +220,7 @@ const $ = (s) => document.querySelector(s);
 
 const state = {
   rows: [],            // {user, app, zone, monthKey, monthLabel, gb, gbUp, gbDown, acts:{name:count}}
-  source: 'sample',
+  source: 'none',
   files: 0,
   zone: 'all',
   month: 'all',
@@ -244,42 +245,20 @@ function fmtGB(n){
 function pct(part, whole){ return whole ? (100*part/whole).toFixed(1) + '%' : '0%'; }
 function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
-/* ---- sample data (seeded, deterministic) -------------------------------- */
-function mulberry32(a){ return function(){ a|=0; a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
-
-function makeSample(){
-  const rnd = mulberry32(20260730);
-  const zones = [['SAZ',0.26],['NAZ',0.15],['MAZ',0.14],['GHQ',0.14],['EUR',0.12],['APAC',0.10],['AFR',0.09]];
-  const apps = [
-    ['ChatGPT',0.24],['Grammarly',0.13],['OpenAI',0.10],['Google Gemini',0.10],
-    ['GitHub Copilot',0.09],['Perplexity AI',0.07],['Microsoft 365 Copilot',0.07],
-    ['Anthropic Claude',0.06],['DeepSeek',0.05],['Microsoft Copilot',0.04],
-    ['NotebookLM',0.03],['HeyGen',0.01],['Synthesia',0.01],['ElevenLabs',0.005],['BLACKBOX AI',0.005],
-  ];
-  const acts = [['Download',0.24],['Post',0.18],['Response',0.17],['Copy',0.12],['Upload',0.10],
-                ['Delete',0.06],['Login Attempt',0.05],['Login Failed',0.03],['Login Successful',0.03],['Logout',0.02]];
-  const months = [['2026-06','Jun 2026'],['2026-07','Jul 2026']];
-  const pick = (list) => { let r = rnd(), acc = 0; for (const [k,w] of list){ acc += w; if (r <= acc) return k; } return list[list.length-1][0]; };
-
-  const rows = [];
-  const N = 7000;
-  for (let i = 0; i < N; i++){
-    const zone = pick(zones);
-    const app = pick(apps);
-    const m = months[rnd() < 0.45 ? 0 : 1];
-    const user = 'user' + Math.floor(rnd()*3400) + '@corp.example';
-    const gbDown = Math.pow(rnd(), 2.6) * 2.2;
-    const gbUp   = Math.pow(rnd(), 3.1) * 1.4;
-    const a = {};
-    const nActs = 1 + Math.floor(rnd()*3);
-    for (let j = 0; j < nActs; j++){
-      const name = pick(acts);
-      a[name] = (a[name]||0) + 1 + Math.floor(Math.pow(rnd(),2)*14);
-    }
-    rows.push({ user, app, zone, monthKey: m[0], monthLabel: m[1],
-                gb: gbDown + gbUp, gbUp, gbDown, acts: a });
+/* ---- completion cheer ---------------------------------------------------- */
+function cheer(){
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  for (let i = 0; i < 60; i++){
+    const p = document.createElement('span');
+    p.style.cssText = 'position:fixed;z-index:200;pointer-events:none;width:8px;height:8px;' +
+      `border-radius:2px;top:-12px;left:${30 + Math.random()*40}vw;background:${SERIES[i % SERIES.length]}`;
+    document.body.appendChild(p);
+    p.animate(
+      [{ transform: 'translate(0,0) rotate(0)', opacity: 1 },
+       { transform: `translate(${Math.random()*30 - 15}vw, ${55 + Math.random()*35}vh) rotate(${Math.random()*720 - 360}deg)`, opacity: 0 }],
+      { duration: 1200 + Math.random()*900, easing: 'cubic-bezier(.2,.6,.4,1)' }
+    ).onfinish = () => p.remove();
   }
-  return rows;
 }
 
 /* ---- CSV loading -------------------------------------------------------- */
@@ -433,6 +412,7 @@ async function loadFiles(fileList){
   state.files += ok;
   state.source = 'files';
   initData();
+  cheer();
 }
 
 /* ---- data init (freeze colors, fill filters) ---------------------------- */
@@ -639,9 +619,9 @@ function render(){
 
   /* source notice + counts */
   const n = $('#srcNotice');
-  if (state.source === 'sample'){
-    n.innerHTML = `<b>Sample data</b> — generated for layout preview. Load one or more export CSVs
-      (<b>Load CSV</b> or drag &amp; drop) to see your tenant's numbers.`;
+  if (state.source !== 'files'){
+    n.innerHTML = `<b>No data loaded yet</b> — click <b>Load CSV</b> (or drag &amp; drop) one or more
+      export files. Every chart fills in as soon as a file loads.`;
   } else {
     n.innerHTML = `<b>${state.files} file${state.files>1?'s':''} loaded</b> — ${fmtInt(state.rows.length)} rows.
       Load more files to append additional days.`;
@@ -656,8 +636,8 @@ function render(){
   $('#kUsers').textContent = fmtCompact(users.size);
   $('#kRecords').textContent = fmtCompact(rows.length);
   $('#kApps').textContent = fmtCompact(apps.size);
-  $('#kActs').textContent = state.hasActivity ? fmtCompact(actEvents) : '—';
-  $('#kActsSub').textContent = state.hasActivity ? 'Upload · Download · Post · …' : 'no Activity column in this export';
+  $('#kActs').textContent = state.hasActivity ? fmtCompact(actEvents) : (rows.length ? '—' : '0');
+  $('#kActsSub').textContent = (state.hasActivity || !rows.length) ? 'Upload · Download · Post · …' : 'no Activity column in this export';
 
   /* aggregates */
   const zoneUsers = new Map(), zoneGB = new Map(), appRecords = new Map(),
@@ -754,7 +734,7 @@ function render(){
       tip: `<div class="t">${esc(name)}</div><div class="v">${fmtInt(v)} events · ${pct(v, actEvents)}</div>` }));
   card('cardActivities', 'Top 10 activities',
     (body) => {
-      if (!state.hasActivity){
+      if (rows.length && !state.hasActivity){
         body.innerHTML = `<div class="empty">This export has no <b>Activity</b> column. Run
           <code>netskope_genai_test.py</code> (activity enrichment on) to populate it.</div>`;
         return;
@@ -845,7 +825,7 @@ $('#fMonth').addEventListener('change', e => { state.month = e.target.value; ren
 $('#fReset').addEventListener('click', () => { state.zone = 'all'; state.month = 'all';
   $('#fZone').value = 'all'; $('#fMonth').value = 'all'; render(); });
 $('#fileIn').addEventListener('change', e => loadFiles(e.target.files));
-$('#resetData').addEventListener('click', () => { state.rows = makeSample(); state.source = 'sample'; state.files = 0; $('#loadStatus').hidden = true; initData(); });
+$('#resetData').addEventListener('click', () => { state.rows = []; state.source = 'none'; state.files = 0; $('#loadStatus').hidden = true; initData(); });
 $('#dlJpeg').addEventListener('click', downloadJPEG);
 
 let dragDepth = 0;
@@ -858,6 +838,5 @@ addEventListener('drop', e => { e.preventDefault(); dragDepth = 0; document.body
 let rT;
 addEventListener('resize', () => { clearTimeout(rT); rT = setTimeout(render, 150); });
 
-state.rows = makeSample();
 initData();
 </script>
