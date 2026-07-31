@@ -27,10 +27,14 @@ WHY datasearch AND NOT /events/data/:
     only one of the three that accepts `fields`, `query` and server-side
     aggregation. That is exactly this job.
 
-Per-event rows are fetched with offset paging inside time windows, then
-collapsed locally to one row per user+application with the byte columns
-summed. Netskope can do that sum server-side instead -- see the
-SERVER-SIDE GROUPBY note in the CONFIGURATION section.
+Rows are fetched with offset paging inside time windows and written out
+ONE ROW PER EVENT: no grouping, no summing, and byte counts left in raw
+bytes exactly as the API returned them. Duplicate events are still dropped
+by their `_id`, which removes API paging artefacts only -- it never merges
+two genuinely distinct events.
+
+Expect this file to be considerably larger than an aggregated one: it is
+one line per page event for the day, not one line per user.
 
 Dependencies: requests, pandas (stdlib: typing, time, csv, json)
 """
@@ -254,23 +258,18 @@ BASE_URL: str = "https://YOUR_TENANT.goskope.com"
 # Per Netskope's docs: "you can view activities of an app in application
 # events and view bytes information in page events."
 #
-# SERVER-SIDE GROUPBY -- a cheaper alternative to this script's approach.
-# datasearch can do the summing itself. Netskope's own documented example is
-# almost exactly this report:
+# NOT RELEVANT HERE, but worth knowing it exists: datasearch can aggregate
+# server-side. Netskope's documented example is
 #
 #   /api/v2/events/datasearch/page?starttime=0&endtime=0&groupby=user
-#     &sortby=server_bytes
-#     &fields=sessions=sum(session_number_unique),
-#             server_bytes=sum(server_bytes_total),
+#     &fields=server_bytes=sum(server_bytes_total),
 #             client_bytes=sum(client_bytes_total),
 #             numbytes=sum(numbytes_total)
 #
-# That returns one pre-aggregated row per user in a single call instead of
-# paging through every event. This script deliberately does NOT use it: the
-# local-collapse path is the one that is hardened here (windowed paging,
-# _id dedupe, retry/backoff, alias resolution), and it keeps both exports
-# behaving identically. If your day volume makes the paging too slow, the
-# groupby form above is the documented way to cut it down.
+# which returns one pre-aggregated row per user in a single call. This
+# script wants the opposite -- untouched per-event rows -- so it pages the
+# raw events instead. Keep that URL in mind only if you later decide you
+# want totals rather than detail.
 ENDPOINT_PATH: str = "/api/v2/events/datasearch/page"
 
 # Authentication style.
@@ -471,51 +470,70 @@ SEND_FIELDS_PARAM: bool = True
 # with a default of 180s, so it is on here.
 SEND_QUERY_TIMEOUT: bool = True
 
-# Collapse the export to unique combinations of these fields. With
-# ["user", "app"] each user/application pair appears once and the three byte
-# columns are SUMMED across every event that collapses into that pair.
+# Collapse the export to unique combinations of these fields.
 #
-# CAVEAT, by design: the per-event columns (URL and Event Date) can only
-# show ONE value per group, and that is the first event's. A user who hit
-# twenty URLs on one app gets the summed traffic for all twenty but only the
-# first URL. To make every displayed column true for its row:
-#     DEDUPE_ON = ["user", "app", "url"]
-# and to keep raw per-event rows with nothing summed, use [].
-DEDUPE_ON: List[str] = ["user", "app"]
+# EMPTY = no collapsing. One row per raw event, exactly as Netskope returned
+# it: a user who hit twenty URLs on one app gets twenty rows, each with that
+# single event's own byte counts. Nothing is merged and nothing is summed,
+# so every value in the CSV is traceable back to one event.
+#
+# Set to ["user", "app"] to get one row per user/application pair instead --
+# but only together with SUM_FIELDS below, or the byte columns would show an
+# arbitrary single event's figures rather than the pair's total.
+DEDUPE_ON: List[str] = []
 
 # Epoch fields (like `timestamp`) are converted to readable dates on export.
+# "ctime"                              -> Tue Dec  9 21:00:20 2025
 # Month/day/year: "%m/%d/%Y"           -> 07/23/2026
 # Day/month/year: "%d/%m/%Y"           -> 23/07/2026
 # Year first:     "%Y-%m-%d"           -> 2026-07-23
 # With time:      "%m/%d/%Y %H:%M:%S"  -> 07/23/2026 14:05:11
 # Times are rendered in the machine's LOCAL timezone, matching how the
 # day boundaries in resolve_day_range are calculated.
-DATE_FORMAT: str = "%m/%d/%Y"
+#
+# "ctime" is a special value, not a strftime pattern. It produces the
+# day-space-padded form above via time.ctime(). Writing it as a pattern
+# would need %e for the space-padded day, and %e does not exist on Windows
+# -- so the sentinel is the portable way to get this exact layout.
+DATE_FORMAT: str = "ctime"
 
 # Fields holding epoch seconds that should be formatted with DATE_FORMAT.
 EPOCH_FIELDS: set = {"timestamp", "_insertion_epoch_timestamp",
                      "_creation_timestamp", "src_time"}
 
-# Numeric fields ADDED UP across rows collapsed by DEDUPE_ON, rather than
-# taking the first row's value. This is what turns per-event byte counts
-# into a per user+application total.
-SUM_FIELDS: set = {"numbytes", "server_bytes", "client_bytes"}
+# Numeric fields ADDED UP across rows collapsed by DEDUPE_ON.
+#
+# EMPTY = nothing is summed. Each row carries its own event's byte counts.
+# (With DEDUPE_ON empty there is nothing to sum across anyway, so these two
+# settings belong together -- change one and you almost certainly want to
+# change the other.)
+SUM_FIELDS: set = set()
 
 # Fields holding a byte count that should be converted to MB on export.
 #
-# NOTE: the requested headers are "Bytes Upload" / "Bytes Download" /
-# "Total Bytes" with no unit, but the values here are converted to MB the
-# same way the companion script does it. To export RAW BYTES instead, empty
-# this set:  BYTES_FIELDS = set()
-BYTES_FIELDS: set = {"numbytes", "server_bytes", "client_bytes"}
+# EMPTY = values are exported as RAW BYTES, exactly as the API returned
+# them. This is why the headers read "Bytes Upload" / "Bytes Download" /
+# "Total Bytes" with no unit suffix. To switch to megabytes, put the three
+# field names back in here and rename the headers accordingly.
+BYTES_FIELDS: set = set()
 
-# Decimal places for the MB conversion.
+# Decimal places for the MB conversion. Unused while BYTES_FIELDS is empty.
 MB_DECIMALS: int = 2
+
+# Fields written as WHOLE NUMBERS.
+#
+# This is not cosmetic. pandas types a column float64 the moment one row is
+# missing a value, so a single event without a byte count turns every figure
+# in that column into "54665.0" instead of "54665". Forcing them back to
+# integers on the way out keeps raw byte counts looking like byte counts.
+#
+# Only applies to fields NOT in BYTES_FIELDS -- an MB value needs decimals.
+INT_FIELDS: set = {"numbytes", "server_bytes", "client_bytes"}
 
 # Prepend a leftmost column holding a row counter, so the first data row
 # (spreadsheet row 2, since row 1 is the header) is numbered
 # ROW_NUMBER_START.
-ADD_ROW_NUMBER: bool = True
+ADD_ROW_NUMBER: bool = False
 ROW_NUMBER_START: int = 1
 
 # Header text for that column. Set to "" for a blank heading.
@@ -1305,9 +1323,25 @@ def format_epoch(value: Any) -> Any:
     if epoch <= 0:
         return ""
     try:
+        if DATE_FORMAT.strip().lower() == "ctime":
+            return time.ctime(epoch)   # Tue Dec  9 21:00:20 2025
         return time.strftime(DATE_FORMAT, time.localtime(epoch))
     except (ValueError, OSError, OverflowError):
         return value          # out of range for the platform's localtime
+
+
+def to_int_text(value: Any) -> Any:
+    """
+    Render a numeric value as a whole number, so a byte count reads 54665
+    rather than 54665.0. Blanks stay blank and anything unparseable is left
+    exactly as it arrived.
+    """
+    if value is None or value == "":
+        return ""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return value
 
 
 def bytes_to_mb(value: Any) -> Any:
@@ -1349,6 +1383,8 @@ def export_csv(rows: List[Dict[str, Any]], columns: List[str], path: str) -> Non
             frame[column] = frame[column].apply(format_epoch)
         elif column in BYTES_FIELDS:
             frame[column] = frame[column].apply(bytes_to_mb)
+        elif column in INT_FIELDS:
+            frame[column] = frame[column].apply(to_int_text)
 
     if RENAME_COLUMNS:
         frame = frame.rename(columns=RENAME_COLUMNS)
@@ -2130,6 +2166,9 @@ def main() -> int:
     if DEDUPE_ON:
         log.info("Unique rows exported    : %s (by %s)",
                  len(flat_rows), "+".join(DEDUPE_ON))
+    else:
+        log.info("Rows exported           : %s (one per event, not grouped)",
+                 len(flat_rows))
     log.info("Columns exported        : %s", len(columns))
     log.info("API calls made          : %s", stats["calls"])
     log.info("Exported to             : %s", output_path)
