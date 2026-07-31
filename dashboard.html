@@ -265,7 +265,18 @@ const ZONE_RULES = [
     'la.interbrew.net/Corporativo/ADM_CENTRAL_AC/Service_Groups/SAZ_LAN_Netskope_Advanced',
     'la.interbrew.net/Corporativo/ADM_CENTRAL_AC/Service_Groups/SAZ_LAN_Netskope_Intermediate' ] },
 ];
-for (const r of ZONE_RULES) r.needles = r.needles.map(n => n.toLowerCase());
+for (const r of ZONE_RULES){
+  const set = new Set();
+  for (const n of r.needles){
+    const low = n.toLowerCase();
+    set.add(low);
+    // Exports often carry just the group NAME without the AD path — match the
+    // last path segment too (skipped when too short/generic, e.g. "Users").
+    const base = low.split('/').pop().trim();
+    if (base.length >= 8) set.add(base);
+  }
+  r.needles = [...set];
+}
 
 /* Display / color order for the mapped zones (first 8 get palette slots). */
 const ZONE_ORDER = ['SAZ','NAZ','MAZ','GHQ','EUR','AFR','APAC IN','APAC VN','APAC KR','APAC CN'];
@@ -287,6 +298,7 @@ const $ = (s) => document.querySelector(s);
 const state = {
   cells: new Map(),      // "zone\u0000monthKey" -> {zone, monthKey, users:Set, gb, gbUp, gbDown, records, apps:Map, acts:Map}
   monthLabels: new Map(),// monthKey -> display label
+  unmatched: new Map(),  // usergroup/OU value -> row count, for zone "Unknown" diagnostics
   rowsTotal: 0,
   source: 'none',
   files: 0,
@@ -299,7 +311,7 @@ const state = {
 };
 
 function clearData(){
-  state.cells = new Map(); state.monthLabels = new Map();
+  state.cells = new Map(); state.monthLabels = new Map(); state.unmatched = new Map();
   state.rowsTotal = 0; state.files = 0; state.source = 'none'; state.hasActivity = false;
 }
 
@@ -387,8 +399,16 @@ async function ingestFile(file, onBytes){
     const zone = deriveZone(idx.ou !== undefined ? c[idx.ou] : '',
                             idx.group !== undefined ? c[idx.group] : '',
                             idx.access !== undefined ? c[idx.access] : '');
+    if (zone === 'Unknown'){
+      const src = String((idx.group !== undefined && c[idx.group]) ? c[idx.group]
+        : (idx.ou !== undefined && c[idx.ou]) ? c[idx.ou] : '(empty)').slice(0, 160);
+      if (state.unmatched.has(src) || state.unmatched.size < 500)
+        state.unmatched.set(src, (state.unmatched.get(src)||0) + 1);
+    }
     const cell = cellFor(zone, monthKey, monthLabel);
-    cell.users.add(c[idx.user] || 'unknown');
+    // One person, several email domains: dedupe on the lowercased part
+    // before the @ so the same account never counts twice.
+    cell.users.add((c[idx.user] || 'unknown').trim().toLowerCase().split('@')[0] || 'unknown');
     cell.gb += total; cell.gbUp += up; cell.gbDown += down; cell.records++;
     const app = c[idx.app] || 'Unknown';
     let a = cell.apps.get(app);
@@ -542,6 +562,12 @@ async function loadFiles(fileList){
     } catch (e) {
       lines.push(['bad', f.name + ' — skipped: ' + (e.error || 'could not read file (' + e.message + ')')]);
     }
+  }
+  if (state.unmatched.size){
+    const unknownRows = [...state.unmatched.values()].reduce((s,v) => s+v, 0);
+    lines.push(['bad', `${unknownRows.toLocaleString('en-US')} rows mapped to zone "Unknown". Most common unmatched User Group / OU values:`]);
+    for (const [v, cnt] of [...state.unmatched.entries()].sort((a,b) => b[1]-a[1]).slice(0, 10))
+      lines.push(['bad', `${cnt.toLocaleString('en-US')}× — ${v}`]);
   }
   lbl.textContent = 'Rendering…';
   await new Promise(r => setTimeout(r));
