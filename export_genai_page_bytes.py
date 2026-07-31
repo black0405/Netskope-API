@@ -530,6 +530,17 @@ MB_DECIMALS: int = 2
 # Only applies to fields NOT in BYTES_FIELDS -- an MB value needs decimals.
 INT_FIELDS: set = {"numbytes", "server_bytes", "client_bytes"}
 
+# Drop any row where EVERY field listed here is zero (or blank/absent).
+#
+# A page event with no bytes in either direction carries nothing for this
+# report -- typically a connection that was blocked, or one that resolved
+# without transferring anything. Listing the two directional fields rather
+# than numbytes is deliberate: it is the upload and download legs that
+# decide whether real traffic happened.
+#
+# Set to [] to keep every row including the all-zero ones.
+DROP_IF_ALL_ZERO: List[str] = ["client_bytes", "server_bytes"]
+
 # Prepend a leftmost column holding a row counter, so the first data row
 # (spreadsheet row 2, since row 1 is the header) is numbered
 # ROW_NUMBER_START.
@@ -1267,6 +1278,23 @@ def to_number(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def drop_zero_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Remove rows where every field in DROP_IF_ALL_ZERO is zero.
+
+    A missing or unparseable value counts as zero, which is the sensible
+    reading for "this event moved no data" -- but it also means that if the
+    byte fields never resolved to a real column, EVERY row looks like a
+    zero row and the export would come back empty. The caller compares the
+    before/after counts and says so plainly when that happens, rather than
+    letting an empty CSV pass for a quiet day.
+    """
+    if not DROP_IF_ALL_ZERO:
+        return rows
+    return [row for row in rows
+            if any(to_number(row.get(f)) != 0 for f in DROP_IF_ALL_ZERO)]
 
 
 def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2145,6 +2173,23 @@ def main() -> int:
     raw_row_count = len(flat_rows)
     flat_rows = dedupe_rows(flat_rows)
 
+    before_zero_filter = len(flat_rows)
+    flat_rows = drop_zero_rows(flat_rows)
+    dropped_zero = before_zero_filter - len(flat_rows)
+
+    # Everything dropped almost never means "a whole day of zero-byte
+    # events". It means the byte fields aren't where we think they are, so
+    # every row read as zero. Say that rather than writing a header-only CSV.
+    if DROP_IF_ALL_ZERO and before_zero_filter and not flat_rows:
+        log.error("Every one of the %d row(s) had zero bytes in %s and was "
+                  "dropped.", before_zero_filter, " and ".join(DROP_IF_ALL_ZERO))
+        log.error("  That usually means the byte fields resolved to nothing "
+                  "-- check the 'field ... NOT FOUND' warnings above and the "
+                  "FIELD_ALIASES list, not the traffic itself.")
+        log.error("  To export anyway, set DROP_IF_ALL_ZERO = [].")
+        write_status(label, result="all_rows_zero", rows=0, uploaded=False)
+        return finish(3, started, run_id)
+
     if DESIRED_COLUMNS:
         missing = [c for c in DESIRED_COLUMNS if c not in discovered]
         if missing:
@@ -2163,6 +2208,8 @@ def main() -> int:
     log.info("-" * 52)
     log.info("Day exported            : %s", label)
     log.info("Total records retrieved : %s", raw_row_count)
+    if dropped_zero:
+        log.info("Zero-traffic rows dropped: %s", dropped_zero)
     if DEDUPE_ON:
         log.info("Unique rows exported    : %s (by %s)",
                  len(flat_rows), "+".join(DEDUPE_ON))
