@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-Export Netskope GenAI page events to CSV.
+Export Netskope GenAI application events to CSV.
 
-Endpoint : GET /api/v2/events/datasearch/page
-Docs     : Netskope REST API v2 - DataSearch
+Endpoint : GET /api/v2/events/data/application
+Docs     : Netskope REST API v2 - Events
 
 Per-event rows are fetched with offset paging inside time windows, then
-collapsed locally to one row per user+application with the byte columns
-summed. No server-side groupby is used.
+collapsed locally to one row per user+application with file_size summed.
+No server-side groupby is used.
+
+Columns exported:
+    User, Application, URL, Activity, Object Type, Object Name,
+    Event Date, Organization Unit, Sum - File Size (MB)
+
+Application events carry the activity/object detail and file_size but NOT
+the traffic byte counts (Total / Uploaded / Downloaded) -- those live on the
+page-events endpoint instead.
 
 Dependencies: requests, pandas (stdlib: typing, time, csv, json)
 """
@@ -220,15 +228,25 @@ BASE_URL: str = "https://YOUR_TENANT.goskope.com"
 # on the Skope IT Query Language and accept the `query` filter and `fields`
 # column selection.
 #
-# WHICH EVENT TYPE MATTERS FOR THE BYTE COLUMNS:
-#   page         Skope IT > Page Events. Carries the traffic byte counts
-#                (Total / Uploaded / Downloaded). Use this one.
+# WHICH EVENT TYPE:
 #   application  Skope IT > Application Events. Activity detail (Login,
-#                Upload, Share, object names) but NO byte fields. Per
-#                Netskope's docs: "you can view activities of an app in
-#                application events and view bytes information in page
-#                events."
-ENDPOINT_PATH: str = "/api/v2/events/datasearch/page"
+#                Upload, Share, object type / object name) and file_size,
+#                but NO traffic byte counts. This is the one we want.
+#   page         Skope IT > Page Events. Carries the traffic byte counts
+#                (Total / Uploaded / Downloaded) but none of the activity
+#                or object detail.
+# Per Netskope's docs: "you can view activities of an app in application
+# events and view bytes information in page events." The required columns
+# are Activity / Object Type / Object Name / File Size, so application
+# events are the correct source -- the byte columns are simply not
+# available here, by the endpoint's design.
+#
+# NOTE ON /events/data/ VS /events/datasearch/:
+# `data` is the plain event endpoint; `datasearch` is the query-language one
+# that additionally accepts `fields` (column selection) and `timeout`. Those
+# two parameters are NOT sent to this endpoint -- see SEND_FIELDS_PARAM and
+# SEND_QUERY_TIMEOUT below.
+ENDPOINT_PATH: str = "/api/v2/events/data/application"
 
 # Authentication style.
 #   "bearer"   -> Authorization: Bearer <token>        (requested / generic)
@@ -340,9 +358,9 @@ REQUEST_TIMEOUT: int = 60      # seconds per HTTP request
 MAX_RETRIES: int = 5           # retries for 429 / 5xx / network errors
 BACKOFF_BASE: float = 2.0      # exponential backoff base, seconds
 
-# The datasearch endpoint takes its own server-side query timeout, in
-# seconds (Swagger marks it required, default 180). Raise it if large
-# windows start returning timeouts.
+# Server-side query timeout in seconds, used only when SEND_QUERY_TIMEOUT is
+# True (i.e. on the datasearch endpoints, which document it as required with
+# a default of 180). Ignored on /events/data/.
 QUERY_TIMEOUT: int = 180
 
 # Print the exact request (URL + params) and a snippet of every raw response
@@ -351,9 +369,13 @@ QUERY_TIMEOUT: int = 180
 # response shape not matching what the script expects.
 DEBUG: bool = False
 
-# Name of the pagination query parameter. The datasearch endpoint documents
-# "offset" (number of rows to skip before presenting results). The older
-# /events/data/ endpoints used "skip" -- change this if you switch back.
+# Name of the pagination query parameter -- the number of rows to skip
+# before returning results. Both v2 event endpoints document "offset"; the
+# older v1 API called it "skip".
+#
+# TROUBLESHOOTING: if paging misbehaves on this endpoint (page 2 repeats
+# page 1, or the run never terminates), the parameter name is being ignored.
+# Try "skip" here before assuming anything else is wrong.
 OFFSET_PARAM_NAME: str = "offset"
 
 # The mandatory filter.
@@ -371,42 +393,31 @@ BASE_FILTER_OPERATOR: str = "in"
 # A column listed here that never appears in the data is still exported,
 # blank, as required.
 #
-# BYTE FIELD NAMES -- read this before troubleshooting empty byte columns.
-# Netskope's own datasearch docs show the traffic totals as:
-#     numbytes        total bytes
-#     client_bytes    bytes sent BY the client   -> uploaded
-#     server_bytes    bytes sent BY the server   -> downloaded
-# Some tenants/schemas expose the "_total" variants instead. Rather than
-# guess, BYTE_FIELD_ALIASES below lists the candidates and the script uses
-# whichever actually appears in the data.
+# The order here IS the column order in the CSV (after the S.No. counter).
+# RENAME_COLUMNS below turns each into its friendly header.
 DESIRED_COLUMNS: List[str] = [
-    "app",                 # Application
     "user",                # User
+    "app",                 # Application
     "url",                 # URL
+    "activity",            # Activity
+    "object_type",         # Object Type
+    "object",              # Object Name
     "timestamp",           # Event Date  (epoch -> DATE_FORMAT)
-    "usergroup",           # User Group
     "organization_unit",   # Organization Unit
-    "numbytes",            # Sum - Total Bytes (MB)
-    "server_bytes",        # Sum - Bytes Downloaded (MB)
-    "client_bytes",        # Sum - Bytes Uploaded (MB)
+    "file_size",           # Sum - File Size (MB)
 ]
 
 # Alternative names for the same measure, tried in order. The first one
 # present in the returned data wins, and its values are copied onto the
-# canonical name used in DESIRED_COLUMNS. This makes the export resilient
-# to the naming differences between Netskope schemas.
-# ingress_* are what this tenant exposes; the plain and _total names are
-# kept as fallbacks. First one present in the data wins.
-#   ingress_client_bytes -> UPLOADED   (traffic in from the end-user client)
-#   ingress_server_bytes -> DOWNLOADED (the return leg)
-BYTE_FIELD_ALIASES: Dict[str, List[str]] = {
-    "numbytes":     ["numbytes", "numbytes_total", "total_bytes", "bytes"],
-    "server_bytes": ["ingress_server_bytes", "server_bytes",
-                     "server_bytes_total",
-                     "bytes_downloaded", "download_bytes"],
-    "client_bytes": ["ingress_client_bytes", "client_bytes",
-                     "client_bytes_total",
-                     "bytes_uploaded", "upload_bytes"],
+# canonical name used in DESIRED_COLUMNS. This keeps the export working
+# across the naming differences between Netskope schemas.
+#
+# Only file_size needs this treatment now -- the traffic byte fields it used
+# to cover (numbytes / client_bytes / server_bytes) do not exist on
+# application events at all, so aliasing them would be pointless.
+FIELD_ALIASES: Dict[str, List[str]] = {
+    "file_size": ["file_size", "object_size", "filesize", "size",
+                  "file_size_bytes"],
 }
 
 # Columns in DESIRED_COLUMNS that do NOT exist in the API schema. They are
@@ -414,20 +425,31 @@ BYTE_FIELD_ALIASES: Dict[str, List[str]] = {
 # parameter, since asking the API for an unknown field can fail the query.
 PLACEHOLDER_COLUMNS: set = set()
 
-# Ask the API to return ONLY the fields we actually export, via the
-# datasearch `fields` parameter (e.g. fields=app,user). This cuts the
-# response from ~100 fields per row down to the handful you need.
+# Ask the API to return ONLY the fields we actually export, via the `fields`
+# parameter (e.g. fields=app,user).
 #
-# NOTE: because the byte field names vary by schema, the request asks for
-# every alias in BYTE_FIELD_ALIASES. Unknown field names are ignored by the
-# API rather than rejected. If your tenant errors on this, set to False and
-# the script will pull everything and pick the right columns locally.
-SEND_FIELDS_PARAM: bool = True
+# OFF for /events/data/: `fields` is a *datasearch* parameter. This endpoint
+# either ignores it or rejects the request, so the script pulls the full
+# record and picks the columns locally instead. Turn it back on only if you
+# switch ENDPOINT_PATH to /api/v2/events/datasearch/application.
+SEND_FIELDS_PARAM: bool = False
+
+# Send the server-side `timeout` query parameter. Also datasearch-only, so
+# it is off here for the same reason.
+SEND_QUERY_TIMEOUT: bool = False
 
 # Collapse the export to unique combinations of these fields. With
-# ["user", "app"] each user/application pair appears once, and the byte
-# columns are SUMMED across every event that collapses into that pair --
-# which is what makes them genuine "Sum -" figures.
+# ["user", "app"] each user/application pair appears once and file_size is
+# SUMMED across every event that collapses into that pair -- which is what
+# makes it a genuine "Sum -" figure.
+#
+# CAVEAT, by design: the per-event columns (Activity, Object Type, Object
+# Name, URL, Event Date) can only show ONE value per group, and that is the
+# first event's. A user who uploaded five files to one app gets the summed
+# size of all five but only the first file's name. If you would rather have
+# every displayed column be true for its row, add the detail fields here:
+#     DEDUPE_ON = ["user", "app", "activity", "object_type", "object"]
+# and to keep raw per-event rows with nothing summed, use [].
 DEDUPE_ON: List[str] = ["user", "app"]
 
 # Epoch fields (like `timestamp`) are converted to readable dates on export.
@@ -444,12 +466,12 @@ EPOCH_FIELDS: set = {"timestamp", "_insertion_epoch_timestamp",
                      "_creation_timestamp", "src_time"}
 
 # Numeric fields ADDED UP across rows collapsed by DEDUPE_ON, rather than
-# taking the first row's value. This is what turns per-event byte counts
-# into a per user+application total.
-SUM_FIELDS: set = {"numbytes", "server_bytes", "client_bytes", "file_size"}
+# taking the first row's value. This is what turns per-event file sizes into
+# a per user+application total.
+SUM_FIELDS: set = {"file_size"}
 
 # Fields holding a byte count that should be converted to MB on export.
-BYTES_FIELDS: set = {"numbytes", "server_bytes", "client_bytes", "file_size"}
+BYTES_FIELDS: set = {"file_size"}
 
 # Decimal places for the MB conversion.
 MB_DECIMALS: int = 2
@@ -466,22 +488,24 @@ ROW_NUMBER_HEADER: str = "S.No."
 # Rename the technical field names to the friendly headers you asked for.
 # Only applied to columns actually present in DESIRED_COLUMNS above.
 RENAME_COLUMNS: Dict[str, str] = {
-    "app": "Application",
+    # The nine exported columns, in DESIRED_COLUMNS order.
     "user": "User",
+    "app": "Application",
     "url": "URL",
-    "timestamp": "Event Date",
-    "usergroup": "User Group",
-    "organization_unit": "Organization Unit",
-    "numbytes": "Sum - Total Bytes (MB)",
-    "server_bytes": "Sum - Bytes Downloaded (MB)",
-    "client_bytes": "Sum - Bytes Uploaded (MB)",
-    # kept in case they're re-added to DESIRED_COLUMNS
     "activity": "Activity",
     "object_type": "Object Type",
     "object": "Object Name",
+    "timestamp": "Event Date",
+    "organization_unit": "Organization Unit",
     "file_size": "Sum - File Size (MB)",
+    # Kept in case they're re-added to DESIRED_COLUMNS. The byte fields only
+    # apply to the page-events endpoint, not to application events.
+    "usergroup": "User Group",
     "action": "Action",
     "alert": "Alert",
+    "numbytes": "Sum - Total Bytes (MB)",
+    "server_bytes": "Sum - Bytes Downloaded (MB)",
+    "client_bytes": "Sum - Bytes Uploaded (MB)",
 }
 
 # ---------------------------------------------------------------------------
@@ -764,23 +788,23 @@ def fields_param() -> Optional[str]:
     for column in DESIRED_COLUMNS:
         if column in PLACEHOLDER_COLUMNS:
             continue
-        # Ask for every known alias of a byte field, since the exact name
-        # varies by schema. Unknown names are ignored by the API.
-        for name in BYTE_FIELD_ALIASES.get(column, [column]):
+        # Ask for every known alias, since the exact name varies by schema.
+        # Unknown names are ignored by the API.
+        for name in FIELD_ALIASES.get(column, [column]):
             if name not in wanted:
                 wanted.append(name)
 
     return ",".join(wanted) if wanted else None
 
 
-def resolve_byte_aliases(rows: List[Dict[str, Any]]) -> None:
+def resolve_field_aliases(rows: List[Dict[str, Any]]) -> None:
     """
-    Normalise byte-field naming, in place.
+    Normalise field naming, in place.
 
     Whichever alias the tenant actually returned is copied onto the
     canonical name used in DESIRED_COLUMNS, so the export doesn't care
-    whether the schema says `numbytes` or `numbytes_total`. Logs which
-    alias won, so an empty byte column is diagnosable at a glance.
+    whether the schema says `file_size` or `object_size`. Logs which alias
+    won, so an empty column is diagnosable at a glance.
     """
     if not rows:
         return
@@ -789,18 +813,18 @@ def resolve_byte_aliases(rows: List[Dict[str, Any]]) -> None:
     for row in rows[:50]:          # sampling is enough to spot the schema
         present.update(row.keys())
 
-    for canonical, aliases in BYTE_FIELD_ALIASES.items():
+    for canonical, aliases in FIELD_ALIASES.items():
         if canonical in present:
             continue               # already the right name
 
         match = next((a for a in aliases if a in present), None)
         if match:
-            log.info("byte field  %s -> using '%s'", canonical, match)
+            log.info("field      %s -> using '%s'", canonical, match)
             for row in rows:
                 if match in row:
                     row[canonical] = row[match]
         else:
-            log.warning("byte field  %s NOT FOUND (tried: %s) -- that column "
+            log.warning("field      %s NOT FOUND (tried: %s) -- that column "
                         "will export as 0", canonical, ", ".join(aliases))
 
 
@@ -828,6 +852,29 @@ def render_progress(stats: Dict[str, int], bar_width: int = 28) -> None:
         end="",
         flush=True,
     )
+
+
+def window_params(query: str, starttime: int, endtime: int) -> Dict[str, Any]:
+    """
+    The query parameters every page request shares.
+
+    `fields` and `timeout` are datasearch-only extras -- on /events/data/
+    they are skipped entirely rather than sent and ignored, because an
+    unrecognised parameter is a plausible cause of an HTTP 400 here.
+    The caller adds the pagination parameter (offset or cursor).
+    """
+    params: Dict[str, Any] = {
+        "query": query,
+        "starttime": starttime,
+        "endtime": endtime,
+        "limit": PAGE_SIZE,
+    }
+    if SEND_QUERY_TIMEOUT:
+        params["timeout"] = QUERY_TIMEOUT
+    selected = fields_param()
+    if selected:
+        params["fields"] = selected
+    return params
 
 
 def fetch_window(
@@ -861,30 +908,12 @@ def fetch_window(
                 target, params = next_url, None
             else:
                 target = url
-                params = {
-                    "query": query,
-                    "starttime": starttime,
-                    "endtime": endtime,
-                    "limit": PAGE_SIZE,
-                    "timeout": QUERY_TIMEOUT,
-                    "cursor": next_url,
-                }
-                selected = fields_param()
-                if selected:
-                    params["fields"] = selected
+                params = window_params(query, starttime, endtime)
+                params["cursor"] = next_url
         else:
             target = url
-            params = {
-                "query": query,
-                "starttime": starttime,
-                "endtime": endtime,
-                "limit": PAGE_SIZE,
-                OFFSET_PARAM_NAME: offset,
-                "timeout": QUERY_TIMEOUT,
-            }
-            selected = fields_param()
-            if selected:
-                params["fields"] = selected
+            params = window_params(query, starttime, endtime)
+            params[OFFSET_PARAM_NAME] = offset
 
         payload = request_page(session, target, params, stats)
 
@@ -1336,11 +1365,10 @@ def diagnose_zero_results(
          what's actually stored is the most common reason for 0 rows.
     """
     url = BASE_URL.rstrip("/") + ENDPOINT_PATH
-    # `timeout` is marked required on this endpoint -- omitting it made the
-    # diagnostic itself fail on tenants that enforce it, right when you most
-    # need it to work.
-    params = {"starttime": start, "endtime": end, "limit": 5,
-              OFFSET_PARAM_NAME: 0, "timeout": QUERY_TIMEOUT}
+    params: Dict[str, Any] = {"starttime": start, "endtime": end,
+                              "limit": 5, OFFSET_PARAM_NAME: 0}
+    if SEND_QUERY_TIMEOUT:
+        params["timeout"] = QUERY_TIMEOUT
 
     print("\nFilter matched nothing -- running one unfiltered check on the "
           "same day to see what's actually there...")
@@ -1367,8 +1395,12 @@ def diagnose_zero_results(
     # Surface anything that looks like it could be the field(s) being
     # filtered on, along with real sample values, so a wrong field name or
     # wrong expected value is obvious at a glance.
+    # "categ"/"org" cover the filter field; the rest cover the exported
+    # columns most likely to come back under an unexpected name.
     candidates = [c for c in cols
-                  if any(term in c.lower() for term in ("categ", "org", "unit", "ou"))]
+                  if any(term in c.lower() for term in
+                         ("categ", "org", "unit", "ou",
+                          "activ", "object", "size"))]
     for field in candidates:
         values = sorted({str(row[field]) for row in flat_sample
                           if row.get(field) not in (None, "")})
@@ -2030,7 +2062,7 @@ def main() -> int:
         return finish(3, started, run_id)
 
     flat_rows = [flatten_record(r) for r in records]
-    resolve_byte_aliases(flat_rows)
+    resolve_field_aliases(flat_rows)
     discovered = discover_columns(flat_rows)
     raw_row_count = len(flat_rows)
     flat_rows = dedupe_rows(flat_rows)
