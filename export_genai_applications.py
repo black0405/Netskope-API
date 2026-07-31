@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Export Netskope application events (category = GenerativeAI) to CSV.
+Export Netskope GenAI page events to CSV.
 
-Endpoint : GET /api/v2/events/data/application
-Docs     : Netskope REST API v2 - Event Data / DataSearch
+Endpoint : GET /api/v2/events/datasearch/page
+Docs     : Netskope REST API v2 - DataSearch
+
+Per-event rows are fetched with offset paging inside time windows, then
+collapsed locally to one row per user+application with the byte columns
+summed. No server-side groupby is used.
 
 Dependencies: requests, pandas (stdlib: typing, time, csv, json)
 """
@@ -311,14 +315,20 @@ API_TOKEN: str = env_str("NETSKOPE_API_TOKEN", "PUT_YOUR_API_TOKEN_HERE")
 # Tenant base URL, no trailing slash. e.g. "https://myorg.goskope.com"
 BASE_URL: str = env_str("NETSKOPE_BASE_URL", "https://YOUR_TENANT.goskope.com")
 
-# Endpoint path (kept separate so other event types are a one-line change).
-# NOTE: use the *datasearch* endpoint, not /events/data/. Per Netskope's
-# docs, the datasearch endpoints are the ones built on the Skope IT Query
-# Language and are what accept the `query` filter, `fields` column
-# selection, and groupbys/orderbys aggregation. This is the API equivalent
-# of Skope IT > Events & Alerts > Application Events.
+# Endpoint path. Use the *datasearch* endpoints -- they are the ones built
+# on the Skope IT Query Language and accept the `query` filter and `fields`
+# column selection.
+#
+# WHICH EVENT TYPE MATTERS FOR THE BYTE COLUMNS:
+#   page         Skope IT > Page Events. Carries the traffic byte counts
+#                (Total / Uploaded / Downloaded). Use this one.
+#   application  Skope IT > Application Events. Activity detail (Login,
+#                Upload, Share, object names) but NO byte fields. Per
+#                Netskope's docs: "you can view activities of an app in
+#                application events and view bytes information in page
+#                events."
 ENDPOINT_PATH: str = env_str("NETSKOPE_ENDPOINT_PATH",
-                             "/api/v2/events/datasearch/application")
+                             "/api/v2/events/datasearch/page")
 
 # Authentication style.
 #   "bearer"   -> Authorization: Bearer <token>        (requested / generic)
@@ -490,11 +500,17 @@ DESIRED_COLUMNS: List[str] = [
 # present in the returned data wins, and its values are copied onto the
 # canonical name used in DESIRED_COLUMNS. This makes the export resilient
 # to the naming differences between Netskope schemas.
+# ingress_* are what this tenant exposes; the plain and _total names are
+# kept as fallbacks. First one present in the data wins.
+#   ingress_client_bytes -> UPLOADED   (traffic in from the end-user client)
+#   ingress_server_bytes -> DOWNLOADED (the return leg)
 BYTE_FIELD_ALIASES: Dict[str, List[str]] = {
     "numbytes":     ["numbytes", "numbytes_total", "total_bytes", "bytes"],
-    "server_bytes": ["server_bytes", "server_bytes_total",
+    "server_bytes": ["ingress_server_bytes", "server_bytes",
+                     "server_bytes_total",
                      "bytes_downloaded", "download_bytes"],
-    "client_bytes": ["client_bytes", "client_bytes_total",
+    "client_bytes": ["ingress_client_bytes", "client_bytes",
+                     "client_bytes_total",
                      "bytes_uploaded", "upload_bytes"],
 }
 
