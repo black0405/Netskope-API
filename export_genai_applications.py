@@ -28,56 +28,21 @@ import pandas as pd
 import requests
 
 # ---------------------------------------------------------------------------
-# CONFIG FILE LOADING
+# CONFIGURATION
 # ---------------------------------------------------------------------------
-# All configuration lives in "config.env" next to this script, so the same
-# code can be promoted from UAT to production by swapping that one file --
-# no code edits, and no secrets in the .py.
+# Everything is configured in this file. There is no config.env, no .env, and
+# nothing is read from environment variables -- edit the constants below and
+# that is the whole configuration story.
 #
-# Precedence (highest first):
-#   1. real environment variables (what a scheduler or container injects)
-#   2. the config file
-#   3. the defaults in this file
+# The settings are grouped into two sections further down:
+#   LOGGING        -- log folder, level, retention
+#   CONFIGURATION  -- tenant, credentials, day to pull, output, SharePoint
 #
-# That order means UAT/PROD can override anything without touching the
-# config file, which is handy for CI or for keeping the secret in a vault.
-#
-# The path can be pointed elsewhere with the NETSKOPE_CONFIG_FILE
-# environment variable -- useful for running UAT and PROD side by side:
-#     NETSKOPE_CONFIG_FILE=/etc/netskope/prod.env python export_...py
+# SECURITY NOTE: the API token and the SharePoint client secret now live in
+# this .py. Anyone who can read the script can read the credentials, and they
+# will follow the file into any copy, backup, or repository it lands in.
+# Keep the file permissions tight (chmod 600 on Linux) and do not commit it.
 # ---------------------------------------------------------------------------
-
-# Filenames looked for, in order, in the script's own folder. The first one
-# that exists wins. ".env" stays in the list so older installs keep working.
-CONFIG_CANDIDATES: Tuple[str, ...] = (
-    "config.env",
-    "api_tokens.env",
-    "config.ini",
-    ".env",
-)
-
-
-def find_config_file() -> str:
-    """
-    Locate the config file: the NETSKOPE_CONFIG_FILE override if set,
-    otherwise the first CONFIG_CANDIDATES name found next to the script.
-    Returns the expected default path if none exist, so error messages can
-    still name a sensible file.
-    """
-    override = os.environ.get("NETSKOPE_CONFIG_FILE") or \
-        os.environ.get("NETSKOPE_ENV_FILE")          # legacy name
-    if override:
-        return override
-
-    here = os.path.dirname(os.path.abspath(__file__))
-    for name in CONFIG_CANDIDATES:
-        candidate = os.path.join(here, name)
-        if os.path.isfile(candidate):
-            return candidate
-    return os.path.join(here, CONFIG_CANDIDATES[0])
-
-
-CONFIG_FILE = find_config_file()
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -100,75 +65,6 @@ def anchored_path(value: str) -> str:
     return os.path.normpath(os.path.join(SCRIPT_DIR, value))
 
 
-
-
-def load_env_file(path: str) -> int:
-    """
-    Minimal KEY=value config parser -- no third-party dependency needed.
-
-    Handles  KEY=value , # comments, blank lines, optional surrounding
-    quotes, and 'export KEY=value'. Real environment variables already set
-    are never overwritten, so a scheduler can override the file.
-
-    Returns the number of values loaded.
-    """
-    loaded = 0
-    try:
-        with open(path, "r", encoding="utf-8-sig") as handle:
-            for raw in handle:
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                if line.lower().startswith("export "):
-                    line = line[7:].lstrip()
-
-                key, _, value = line.partition("=")
-                key = key.strip()
-                value = value.strip()
-
-                # Strip matching quotes, then any trailing inline comment
-                # on unquoted values.
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                    value = value[1:-1]
-                elif " #" in value:
-                    value = value.split(" #", 1)[0].strip()
-
-                if key and key not in os.environ:
-                    os.environ[key] = value
-                    loaded += 1
-    except FileNotFoundError:
-        return 0
-    return loaded
-
-
-CONFIG_LOADED = load_env_file(CONFIG_FILE)
-
-
-def env_str(key: str, default: str = "") -> str:
-    """Read a text setting."""
-    value = os.environ.get(key)
-    return default if value is None or value == "" else value
-
-
-def env_bool(key: str, default: bool = False) -> bool:
-    """Read an on/off setting. Accepts true/yes/on/1 in any case."""
-    value = os.environ.get(key)
-    if value is None or value == "":
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def env_int(key: str, default: int) -> int:
-    """Read a whole-number setting, falling back if it isn't a number."""
-    value = os.environ.get(key)
-    if value is None or value == "":
-        return default
-    try:
-        return int(str(value).strip())
-    except ValueError:
-        return default
-
-
 # ---------------------------------------------------------------------------
 # LOGGING
 # ---------------------------------------------------------------------------
@@ -183,10 +79,10 @@ def env_int(key: str, default: int) -> int:
 # ARCHIVE_RETENTION_DAYS are removed (0 = keep forever).
 # ---------------------------------------------------------------------------
 
-LOG_DIR: str = anchored_path(env_str("LOG_DIR", "./logs"))
-LOG_LEVEL: str = env_str("LOG_LEVEL", "INFO").upper()
-LOG_RETENTION_DAYS: int = env_int("LOG_RETENTION_DAYS", 20)
-ARCHIVE_RETENTION_DAYS: int = env_int("ARCHIVE_RETENTION_DAYS", 180)
+LOG_DIR: str = anchored_path("./logs")
+LOG_LEVEL: str = "INFO"                    # DEBUG | INFO | WARNING | ERROR
+LOG_RETENTION_DAYS: int = 20
+ARCHIVE_RETENTION_DAYS: int = 180          # 0 = keep archives forever
 LOG_BASENAME: str = "netskope_export.log"
 
 log = logging.getLogger("netskope_export")
@@ -215,8 +111,13 @@ def setup_logging(run_id: str = "-") -> str:
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, LOG_BASENAME)
 
-    log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    # .upper() matters: getattr(logging, "info") returns the log FUNCTION, not
+    # a level int, and setLevel would then fail on a lowercase setting.
+    log.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
     log.handlers.clear()
+    # Filters too, not just handlers -- otherwise a second call stacks another
+    # RunContext on the logger and every record is stamped twice over.
+    log.filters.clear()
     log.propagate = False
 
     # Every line carries the run id, so two runs in one day stay readable.
@@ -306,14 +207,14 @@ def archive_old_logs() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION  -- values come from .env; edit that file, not this one
+# CONFIGURATION  -- edit the values here; this is the only place settings live
 # ---------------------------------------------------------------------------
 
 # Your API token. Netskope issues these under Settings > Tools > REST API v2.
-API_TOKEN: str = env_str("NETSKOPE_API_TOKEN", "PUT_YOUR_API_TOKEN_HERE")
+API_TOKEN: str = "PUT_YOUR_API_TOKEN_HERE"
 
 # Tenant base URL, no trailing slash. e.g. "https://myorg.goskope.com"
-BASE_URL: str = env_str("NETSKOPE_BASE_URL", "https://YOUR_TENANT.goskope.com")
+BASE_URL: str = "https://YOUR_TENANT.goskope.com"
 
 # Endpoint path. Use the *datasearch* endpoints -- they are the ones built
 # on the Skope IT Query Language and accept the `query` filter and `fields`
@@ -327,29 +228,29 @@ BASE_URL: str = env_str("NETSKOPE_BASE_URL", "https://YOUR_TENANT.goskope.com")
 #                Netskope's docs: "you can view activities of an app in
 #                application events and view bytes information in page
 #                events."
-ENDPOINT_PATH: str = env_str("NETSKOPE_ENDPOINT_PATH",
-                             "/api/v2/events/datasearch/page")
+ENDPOINT_PATH: str = "/api/v2/events/datasearch/page"
 
 # Authentication style.
 #   "bearer"   -> Authorization: Bearer <token>        (requested / generic)
 #   "netskope" -> Netskope-Api-Token: <token>          (what Netskope expects)
 # If you get 401s with "bearer", flip this to "netskope".
-AUTH_MODE: str = env_str("NETSKOPE_AUTH_MODE", "bearer")
+AUTH_MODE: str = "bearer"
 
 # Output file. If DATE_STAMP_FILENAME is True the day being exported is
 # appended, e.g. GenerativeAI_Applications_2026-07-19.csv -- useful when a
 # folder of dated files is being picked up downstream.
 # Change the extension to .xlsx if you ever want Excel output instead; the
 # writer switches on the extension (that path needs the openpyxl package).
-OUTPUT_FILE: str = env_str("OUTPUT_FILE", "GenerativeAI_Applications.csv")
+OUTPUT_FILE: str = "GenerativeAI_Applications.csv"
 
-# Folder the CSVs are written into. Created if missing.
-OUTPUT_DIR: str = anchored_path(env_str("OUTPUT_DIR", "./output"))
-DATE_STAMP_FILENAME: bool = env_bool("DATE_STAMP_FILENAME", True)
+# Folder the CSVs are written into. Created if missing. A relative path is
+# anchored to this script's folder, never the current working directory.
+OUTPUT_DIR: str = anchored_path("./output")
+DATE_STAMP_FILENAME: bool = True
 
 # Worksheet name used only when OUTPUT_FILE has a .xlsx extension.
 # Excel limits: max 31 chars, and none of  : \ / ? * [ ]
-EXCEL_SHEET_NAME: str = env_str("EXCEL_SHEET_NAME", "in")
+EXCEL_SHEET_NAME: str = "in"
 
 # --- Which single day to pull ---------------------------------------------
 # DAY_MODE:
@@ -357,14 +258,14 @@ EXCEL_SHEET_NAME: str = env_str("EXCEL_SHEET_NAME", "in")
 #   "today"     -> midnight local through right now
 #   "date"      -> the specific calendar day named in TARGET_DATE
 #   "rolling"   -> the trailing 24 hours from this moment
-DAY_MODE: str = env_str("DAY_MODE", "yesterday")
-TARGET_DATE: str = env_str("TARGET_DATE", "2026-07-19")
+DAY_MODE: str = "yesterday"
+TARGET_DATE: str = "2026-07-19"     # only used when DAY_MODE = "date"
 
 # --- Unattended / scheduled runs -----------------------------------------
 # INTERACTIVE False skips the "which day?" prompt entirely and just uses
 # DAY_MODE, so the script can run from Task Scheduler / cron with no one at
 # the keyboard. Set True if you'd rather be asked each time.
-INTERACTIVE: bool = env_bool("INTERACTIVE", False)
+INTERACTIVE: bool = False
 
 # A date can also be passed on the command line, which overrides DAY_MODE:
 #     python export_genai_applications.py              -> yesterday
@@ -372,53 +273,47 @@ INTERACTIVE: bool = env_bool("INTERACTIVE", False)
 #
 # Skip the run (exit 0) if the output file for that day already exists.
 # Keeps a re-run or an overlapping schedule from redoing finished work.
-SKIP_IF_EXISTS: bool = env_bool("SKIP_IF_EXISTS", True)
+# False while testing, so re-running the same day actually re-runs it.
+SKIP_IF_EXISTS: bool = False
 
 # --- SharePoint upload ----------------------------------------------------
-# Set to False to only write the CSV locally and skip uploading.
-SHAREPOINT_ENABLED: bool = env_bool("SHAREPOINT_ENABLED", True)
+# False writes the CSV locally and skips the upload entirely -- no Graph
+# credentials needed. Set True once you're ready to test the upload leg.
+SHAREPOINT_ENABLED: bool = False
 
 # Entra ID app registration (the SPN you had created).
-# SECURITY: prefer environment variables over hardcoding the secret. The
-# script reads these env vars first and only falls back to the constants
-# below if they're unset:
-#     SPN_TENANT_ID / SPN_CLIENT_ID / SPN_CLIENT_SECRET
-# These three come from the SPN (Entra ID app registration) your admin
-# created. They are static values you paste into the config file.
+# These three are static values from the SPN your admin created.
 #
 # Not to be confused with the Graph ACCESS TOKEN, which the script fetches
 # at runtime by exchanging these three -- that one is short-lived and is
 # never configured anywhere.
 #
-# GRAPH_* names are still accepted for backwards compatibility.
-TENANT_ID: str = env_str("SPN_TENANT_ID",
-                         env_str("GRAPH_TENANT_ID", "PUT_TENANT_ID_HERE"))
-CLIENT_ID: str = env_str("SPN_CLIENT_ID",
-                         env_str("GRAPH_CLIENT_ID", "PUT_CLIENT_ID_HERE"))
-CLIENT_SECRET: str = env_str("SPN_CLIENT_SECRET",
-                             env_str("GRAPH_CLIENT_SECRET",
-                                     "PUT_CLIENT_SECRET_HERE"))
+# SECURITY: CLIENT_SECRET is a live credential sitting in a source file.
+# See the note at the top of the script.
+TENANT_ID: str = "PUT_TENANT_ID_HERE"
+CLIENT_ID: str = "PUT_CLIENT_ID_HERE"
+CLIENT_SECRET: str = "PUT_CLIENT_SECRET_HERE"
 
 # Where to put the file. Two ways to identify the site:
 #   A) leave SITE_ID blank and fill in the hostname + path, and the script
 #      resolves the ID for you (easier, costs one extra API call)
 #   B) paste a known SITE_ID and the hostname/path are ignored
-SITE_HOSTNAME: str = env_str("SHAREPOINT_SITE_HOSTNAME", "yourtenant.sharepoint.com")
-SITE_PATH: str = env_str("SHAREPOINT_SITE_PATH", "/sites/YourSiteName")
-SITE_ID: str = env_str("SHAREPOINT_SITE_ID", "")
+SITE_HOSTNAME: str = "yourtenant.sharepoint.com"
+SITE_PATH: str = "/sites/YourSiteName"
+SITE_ID: str = ""
 
 # Document library ("drive"). Leave DRIVE_ID blank to look the library up by
 # name; "Documents" is the default library on most sites (it shows in the UI
 # as "Shared Documents").
-LIBRARY_NAME: str = env_str("SHAREPOINT_LIBRARY_NAME", "Documents")
-DRIVE_ID: str = env_str("SHAREPOINT_DRIVE_ID", "")
+LIBRARY_NAME: str = "Documents"
+DRIVE_ID: str = ""
 
 # Folder inside the library. "" uploads to the library root. Nested paths
 # are fine ("Reports/Netskope/GenAI"); missing folders are created.
-TARGET_FOLDER: str = env_str("SHAREPOINT_FOLDER", "Netskope/GenAI")
+TARGET_FOLDER: str = "Netskope/GenAI"
 
 # Overwrite a file of the same name if it's already up there.
-SHAREPOINT_REPLACE_EXISTING: bool = env_bool("SHAREPOINT_REPLACE_EXISTING", True)
+SHAREPOINT_REPLACE_EXISTING: bool = True
 
 # One calendar day in seconds.
 ONE_DAY: int = 86400
@@ -432,13 +327,13 @@ ONE_DAY: int = 86400
 BOUNDARY_TRIM: int = 0
 
 # Records per page. Netskope caps this at 10000 for event data.
-PAGE_SIZE: int = env_int("PAGE_SIZE", 5000)
+PAGE_SIZE: int = 5000
 
 # Offset pagination on this API becomes unreliable past roughly 10k records
 # in a single query (the backend re-sorts between pages, producing duplicates
 # and gaps). To stay correct we split the lookback into windows and paginate
 # inside each window. Set to 0 to disable windowing and use one flat query.
-TIME_WINDOW_SECONDS: int = env_int("TIME_WINDOW_SECONDS", 3600)
+TIME_WINDOW_SECONDS: int = 3600
 
 # Network behaviour.
 REQUEST_TIMEOUT: int = 60      # seconds per HTTP request
@@ -448,13 +343,13 @@ BACKOFF_BASE: float = 2.0      # exponential backoff base, seconds
 # The datasearch endpoint takes its own server-side query timeout, in
 # seconds (Swagger marks it required, default 180). Raise it if large
 # windows start returning timeouts.
-QUERY_TIMEOUT: int = env_int("QUERY_TIMEOUT", 180)
+QUERY_TIMEOUT: int = 180
 
 # Print the exact request (URL + params) and a snippet of every raw response
 # to the console. Turn this on FIRST if you're getting zero records -- it
 # will show you immediately whether the problem is auth, the filter, or the
 # response shape not matching what the script expects.
-DEBUG: bool = env_bool("DEBUG", False)
+DEBUG: bool = False
 
 # Name of the pagination query parameter. The datasearch endpoint documents
 # "offset" (number of rows to skip before presenting results). The older
@@ -467,9 +362,9 @@ OFFSET_PARAM_NAME: str = "offset"
 # the web/URL category and is a different taxonomy. The tenant's Swagger
 # page documents the filter example as:
 #     query=appcategory eq 'Cloud Storage' and app eq 'Microsoft Office'
-BASE_FILTER_FIELD: str = env_str("FILTER_FIELD", "appcategory")
-BASE_FILTER_VALUE: str = env_str("FILTER_VALUE", "Generative AI")
-BASE_FILTER_OPERATOR: str = env_str("FILTER_OPERATOR", "in")
+BASE_FILTER_FIELD: str = "appcategory"
+BASE_FILTER_VALUE: str = "Generative AI"
+BASE_FILTER_OPERATOR: str = "in"
 
 # Restrict and reorder the exported CSV to exactly these fields. Leave empty
 # to keep the default behaviour (every discovered field becomes a column).
@@ -527,7 +422,7 @@ PLACEHOLDER_COLUMNS: set = set()
 # every alias in BYTE_FIELD_ALIASES. Unknown field names are ignored by the
 # API rather than rejected. If your tenant errors on this, set to False and
 # the script will pull everything and pick the right columns locally.
-SEND_FIELDS_PARAM: bool = env_bool("SEND_FIELDS_PARAM", True)
+SEND_FIELDS_PARAM: bool = True
 
 # Collapse the export to unique combinations of these fields. With
 # ["user", "app"] each user/application pair appears once, and the byte
@@ -542,7 +437,7 @@ DEDUPE_ON: List[str] = ["user", "app"]
 # With time:      "%m/%d/%Y %H:%M:%S"  -> 07/23/2026 14:05:11
 # Times are rendered in the machine's LOCAL timezone, matching how the
 # day boundaries in resolve_day_range are calculated.
-DATE_FORMAT: str = env_str("DATE_FORMAT", "%m/%d/%Y")
+DATE_FORMAT: str = "%m/%d/%Y"
 
 # Fields holding epoch seconds that should be formatted with DATE_FORMAT.
 EPOCH_FIELDS: set = {"timestamp", "_insertion_epoch_timestamp",
@@ -557,7 +452,7 @@ SUM_FIELDS: set = {"numbytes", "server_bytes", "client_bytes", "file_size"}
 BYTES_FIELDS: set = {"numbytes", "server_bytes", "client_bytes", "file_size"}
 
 # Decimal places for the MB conversion.
-MB_DECIMALS: int = env_int("MB_DECIMALS", 2)
+MB_DECIMALS: int = 2
 
 # Prepend a leftmost column holding a row counter, so the first data row
 # (spreadsheet row 2, since row 1 is the header) is numbered
@@ -566,7 +461,7 @@ ADD_ROW_NUMBER: bool = True
 ROW_NUMBER_START: int = 1
 
 # Header text for that column. Set to "" for a blank heading.
-ROW_NUMBER_HEADER: str = env_str("ROW_NUMBER_HEADER", "S.No.")
+ROW_NUMBER_HEADER: str = "S.No."
 
 # Rename the technical field names to the friendly headers you asked for.
 # Only applied to columns actually present in DESIRED_COLUMNS above.
@@ -952,12 +847,31 @@ def fetch_window(
     records: List[Dict[str, Any]] = []
     offset = 0
     next_url: Optional[str] = None
+    # Cursor mode is only reached if the tenant returns a next-pointer. If it
+    # ever hands back one we've already followed, the loop below would run
+    # forever -- remember them and stop instead.
+    seen_cursors: set = set()
 
     while True:
         if next_url:
-            # Cursor mode: the API handed us a full URL or token.
-            target = next_url if next_url.startswith("http") else url
-            params = None if next_url.startswith("http") else {"cursor": next_url}
+            # Cursor mode: the API handed us a full URL or token. A bare token
+            # still needs the query and the window bounds resent -- dropping
+            # them made the follow-up page unfiltered and unbounded.
+            if next_url.startswith("http"):
+                target, params = next_url, None
+            else:
+                target = url
+                params = {
+                    "query": query,
+                    "starttime": starttime,
+                    "endtime": endtime,
+                    "limit": PAGE_SIZE,
+                    "timeout": QUERY_TIMEOUT,
+                    "cursor": next_url,
+                }
+                selected = fields_param()
+                if selected:
+                    params["fields"] = selected
         else:
             target = url
             params = {
@@ -995,6 +909,12 @@ def fetch_window(
 
         cursor = extract_cursor(payload)
         if cursor:
+            if cursor in seen_cursors:
+                log.warning("Pagination cursor repeated -- stopping this "
+                            "window at %d record(s) rather than looping.",
+                            len(records))
+                break
+            seen_cursors.add(cursor)
             next_url = cursor
             continue
 
@@ -1021,6 +941,24 @@ def local_midnight(epoch: float) -> int:
     return int(time.mktime(time.struct_time(parts)))
 
 
+def next_local_midnight(day_start: int) -> int:
+    """
+    Midnight of the day AFTER the one starting at day_start, in local time.
+
+    Not the same as day_start + 86400: on a DST changeover the local day is
+    23 or 25 hours long, so plain addition lands an hour either side of
+    midnight and the window silently gains or loses an hour of events.
+    Overshooting into the middle of the next day and snapping back is
+    correct on every day of the year.
+    """
+    return local_midnight(day_start + ONE_DAY + (4 * 3600))
+
+
+def previous_local_midnight(day_start: int) -> int:
+    """Midnight of the day BEFORE day_start. DST-safe, same reasoning."""
+    return local_midnight(day_start - (4 * 3600))
+
+
 def resolve_day_range() -> Tuple[int, int, str]:
     """
     Work out the single day to export.
@@ -1035,14 +973,15 @@ def resolve_day_range() -> Tuple[int, int, str]:
         end = int(now)
 
     elif DAY_MODE == "yesterday":
-        start = local_midnight(now) - ONE_DAY
-        end = local_midnight(now) - BOUNDARY_TRIM
+        today = local_midnight(now)
+        start = previous_local_midnight(today)
+        end = today - BOUNDARY_TRIM
 
     elif DAY_MODE == "date":
         # strptime gives us the naive date; mktime turns it into local epoch.
         parsed = time.strptime(TARGET_DATE, "%Y-%m-%d")
         start = int(time.mktime(parsed))
-        end = start + ONE_DAY - BOUNDARY_TRIM
+        end = next_local_midnight(start) - BOUNDARY_TRIM
 
     elif DAY_MODE == "rolling":
         end = int(now)
@@ -1080,7 +1019,7 @@ def prompt_for_date_range() -> Tuple[int, int, str]:
             print(f"'{cli_date}' isn't a valid date (expected YYYY-MM-DD).")
             raise
         start = int(time.mktime(parsed))
-        return start, start + ONE_DAY - BOUNDARY_TRIM, cli_date
+        return start, next_local_midnight(start) - BOUNDARY_TRIM, cli_date
 
     # 2. No prompt on unattended runs.
     if not INTERACTIVE:
@@ -1101,7 +1040,7 @@ def prompt_for_date_range() -> Tuple[int, int, str]:
         return resolve_day_range()
 
     start = int(time.mktime(parsed))
-    end = start + ONE_DAY - BOUNDARY_TRIM
+    end = next_local_midnight(start) - BOUNDARY_TRIM
     return start, end, entry
 
 
@@ -1397,7 +1336,11 @@ def diagnose_zero_results(
          what's actually stored is the most common reason for 0 rows.
     """
     url = BASE_URL.rstrip("/") + ENDPOINT_PATH
-    params = {"starttime": start, "endtime": end, "limit": 5, OFFSET_PARAM_NAME: 0}
+    # `timeout` is marked required on this endpoint -- omitting it made the
+    # diagnostic itself fail on tenants that enforce it, right when you most
+    # need it to work.
+    params = {"starttime": start, "endtime": end, "limit": 5,
+              OFFSET_PARAM_NAME: 0, "timeout": QUERY_TIMEOUT}
 
     print("\nFilter matched nothing -- running one unfiltered check on the "
           "same day to see what's actually there...")
@@ -1458,19 +1401,10 @@ class UploadError(RuntimeError):
 
 def graph_credentials() -> Tuple[str, str, str]:
     """
-    Read credentials, preferring environment variables over the constants
-    so the secret needn't live in the file. Raises if anything is missing.
+    Return the SPN credentials, raising a clear error if they're still the
+    placeholder values rather than letting Graph fail with a vague 401.
     """
-    import os
-
-    # SPN_* is the current name; GRAPH_* is accepted as a legacy alias so
-    # an older config file keeps working after the rename.
-    tenant = (os.environ.get("SPN_TENANT_ID")
-              or os.environ.get("GRAPH_TENANT_ID") or TENANT_ID)
-    client = (os.environ.get("SPN_CLIENT_ID")
-              or os.environ.get("GRAPH_CLIENT_ID") or CLIENT_ID)
-    secret = (os.environ.get("SPN_CLIENT_SECRET")
-              or os.environ.get("GRAPH_CLIENT_SECRET") or CLIENT_SECRET)
+    tenant, client, secret = TENANT_ID, CLIENT_ID, CLIENT_SECRET
 
     missing = [
         name for name, value in
@@ -1480,8 +1414,8 @@ def graph_credentials() -> Tuple[str, str, str]:
     if missing:
         raise UploadError(
             f"Missing SharePoint credential(s): {', '.join(missing)}. "
-            f"Set SPN_TENANT_ID / SPN_CLIENT_ID / SPN_CLIENT_SECRET in "
-            f"{os.path.basename(CONFIG_FILE)} (or as environment variables)."
+            f"Set TENANT_ID / CLIENT_ID / CLIENT_SECRET in the CONFIGURATION "
+            f"section of {os.path.basename(__file__)}."
         )
     return tenant, client, secret
 
@@ -1538,7 +1472,7 @@ def graph_get(session: requests.Session, url: str) -> Dict[str, Any]:
             f"specific site.\n"
             f"  The API permission alone grants nothing -- an admin must run "
             f"the site-level grant once.\n"
-            f"  Run  python {sys.argv[0].rsplit('/', 1)[-1]} --grant-help  "
+            f"  Run  python {os.path.basename(sys.argv[0])} --grant-help  "
             f"for the exact command."
         )
     if not response.ok:
@@ -1665,6 +1599,7 @@ def upload_large(session: requests.Session, drive_id: str,
         raise UploadError("Upload session response had no uploadUrl.")
 
     sent = 0
+    chunk_response: Optional[requests.Response] = None
     with open(local_path, "rb") as handle:
         while sent < size:
             chunk = handle.read(CHUNK_SIZE)
@@ -1694,6 +1629,11 @@ def upload_large(session: requests.Session, drive_id: str,
 
     if sys.stdout.isatty():
         print()
+
+    # chunk_response is None only if the file read empty, in which case no
+    # chunk was ever PUT -- referencing it unguarded raised UnboundLocalError.
+    if chunk_response is None:
+        raise UploadError(f"Nothing was uploaded: {local_path} read as empty.")
     return chunk_response.json() if chunk_response.content else {}
 
 
@@ -1714,7 +1654,7 @@ def upload_to_sharepoint(local_path: str) -> str:
 
     site_id = resolve_site_id(session)
     drive_id = resolve_drive_id(session, site_id)
-    destination = remote_path(local_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1])
+    destination = remote_path(os.path.basename(local_path))
 
     if size <= SIMPLE_UPLOAD_LIMIT:
         item = upload_small(session, drive_id, local_path, destination)
@@ -1752,12 +1692,13 @@ def upload_to_sharepoint(local_path: str) -> str:
 #      plain foreground run is the last resort.
 # ---------------------------------------------------------------------------
 
-SCREEN_ENABLED: bool = env_bool("USE_SCREEN", True)
-SCREEN_NAME: str = env_str("SCREEN_NAME", "Netskope GenAI")
+# False while testing -- the relaunch only earns its keep on a long SSH run.
+SCREEN_ENABLED: bool = False
+SCREEN_NAME: str = "Netskope GenAI"
 
 # "auto" tries screen then tmux; force one with "screen" or "tmux";
-# "none" disables the wrapper the same as USE_SCREEN=false.
-SCREEN_TOOL: str = env_str("SCREEN_TOOL", "auto").lower()
+# "none" disables the wrapper the same as SCREEN_ENABLED = False.
+SCREEN_TOOL: str = "auto"
 
 # Guard variable set on the relaunched child.
 IN_SCREEN_MARKER: str = "NETSKOPE_IN_SCREEN"
@@ -1786,12 +1727,13 @@ def already_in_session() -> bool:
 
 def pick_multiplexer() -> Optional[str]:
     """Return the path to screen or tmux, honouring SCREEN_TOOL."""
-    if SCREEN_TOOL in ("none", "off", "false"):
+    choice = SCREEN_TOOL.strip().lower()
+    if choice in ("none", "off", "false"):
         return None
     order = {
         "screen": ["screen"],
         "tmux": ["tmux"],
-    }.get(SCREEN_TOOL, ["screen", "tmux"])
+    }.get(choice, ["screen", "tmux"])
     for tool in order:
         path = shutil.which(tool)
         if path:
@@ -1799,17 +1741,21 @@ def pick_multiplexer() -> Optional[str]:
     return None
 
 
-def relaunch_in_session() -> bool:
+def relaunch_in_session() -> Optional[int]:
     """
     Re-run this script inside a named screen/tmux session and attach to it.
 
-    Returns True if the process was handed off (the caller should exit),
-    False if we should just carry on in the foreground.
+    Returns the child's exit code if the process was handed off (the caller
+    should exit with it), or None if we should carry on in the foreground.
+
+    Returning the child's code matters: handing back a bare True made the
+    parent exit 0 even when the real run failed, hiding every failure from
+    whatever is watching exit codes.
     """
     if not SCREEN_ENABLED or os.name != "posix":
-        return False
+        return None
     if already_in_session() or not running_interactively():
-        return False
+        return None
 
     tool_path = pick_multiplexer()
     if not tool_path:
@@ -1818,7 +1764,7 @@ def relaunch_in_session() -> bool:
               "      On RHEL 9:  sudo dnf install -y tmux\n"
               "      (screen lives in EPEL:  sudo dnf install -y epel-release "
               "screen)\n")
-        return False
+        return None
 
     tool = os.path.basename(tool_path)
     python = sys.executable or "python3"
@@ -1846,12 +1792,12 @@ def relaunch_in_session() -> bool:
 
     try:
         completed = subprocess.run(command, env=child_env)
-        return True if completed.returncode is not None else False
+        return completed.returncode
     except FileNotFoundError:
-        return False
+        return None
     except Exception as exc:
         print(f"Could not start {tool} ({exc}) -- running in the foreground.")
-        return False
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1948,8 +1894,10 @@ def run_check(run_id: str, started: float) -> int:
         return finish(2, started, run_id)
 
     rows = status.get("rows")
-    log.info("export     OK (%s rows)" % rows if rows is not None
-             else "export     OK")
+    if rows is not None:
+        log.info("export     OK (%s rows)", rows)
+    else:
+        log.info("export     OK")
 
     # --- Did the upload happen? -------------------------------------------
     if not SHAREPOINT_ENABLED:
@@ -2010,8 +1958,7 @@ def main() -> int:
 
     log.info("=" * 64)
     log.info("RUN START  %s", time.strftime("%Y-%m-%d %H:%M:%S"))
-    log.info("config     %s", CONFIG_FILE if CONFIG_LOADED
-             else f"{CONFIG_FILE} NOT FOUND -- using built-in defaults")
+    log.info("config     in-script (%s)", os.path.basename(__file__))
     log.info("log file   %s", log_path)
 
     archive_old_logs()
@@ -2022,8 +1969,9 @@ def main() -> int:
         return run_check(run_id, started)
 
     if "PUT_YOUR_API_TOKEN" in API_TOKEN or "YOUR_TENANT" in BASE_URL:
-        log.error("CONFIG ERROR: NETSKOPE_API_TOKEN / NETSKOPE_BASE_URL not "
-                  "set in %s", CONFIG_FILE)
+        log.error("CONFIG ERROR: API_TOKEN / BASE_URL are still placeholders.")
+        log.error("  Set them in the CONFIGURATION section near the top of %s.",
+                  os.path.basename(__file__))
         return finish(1, started, run_id)
 
     try:
@@ -2174,9 +2122,12 @@ if __name__ == "__main__":
 
     # Interactive first run: hand off into a named screen/tmux session so
     # the job survives a dropped SSH connection. Silently skipped under
-    # cron/systemd, and when --no-screen is passed.
-    if "--no-screen" not in sys.argv and relaunch_in_session():
-        sys.exit(0)
+    # cron/systemd, and when --no-screen is passed. The child's exit code is
+    # passed straight through so a failure inside the session still surfaces.
+    if "--no-screen" not in sys.argv:
+        child_code = relaunch_in_session()
+        if child_code is not None:
+            sys.exit(child_code)
 
     # Exit code lets Task Scheduler / cron flag a failed run.
     sys.exit(main())
