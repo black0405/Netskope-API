@@ -218,13 +218,15 @@ function getCss(v){ return getComputedStyle(document.documentElement).getPropert
    Method). Matching is case-insensitive substring, so multi-valued
    usergroup cells (several AD groups joined in one field) still match. */
 const ZONE_RULES = [
-  { zone: 'APAC IN', field: 'group', needles: [
-    'AP1.OFC.LOC/India/Groups/IN_Global_netskope_AP1User',
-    'india.asia.gcn.local/IN/Administrative/Groups - Security/IN_Global_netskope_Alluser',
-    'ONE.OFC.LOC/Zone-ABI Global/Managed Objects/Managed Groups/SONEG-Netskope-ABI-GOA Team' ] },
-  { zone: 'APAC VN', field: 'ou', needles: [ 'AP1.OFC.LOC/Vietnam/Users' ] },
-  { zone: 'APAC KR', field: 'group', needles: [ 'ob.co.kr/OB/Groups/User/manual/S001' ] },
-  { zone: 'APAC CN', field: 'access', needles: [ 'Local Proxy' ] },
+  // The APAC countries report as one zone. The per-country rules are kept
+  // apart so the split can be restored by giving them their own zone name.
+  { zone: 'APAC', field: 'group', needles: [
+    'AP1.OFC.LOC/India/Groups/IN_Global_netskope_AP1User',                                    // India
+    'india.asia.gcn.local/IN/Administrative/Groups - Security/IN_Global_netskope_Alluser',    // India
+    'ONE.OFC.LOC/Zone-ABI Global/Managed Objects/Managed Groups/SONEG-Netskope-ABI-GOA Team', // India
+    'ob.co.kr/OB/Groups/User/manual/S001' ] },                                                // Korea
+  { zone: 'APAC', field: 'ou', needles: [ 'AP1.OFC.LOC/Vietnam/Users' ] },                    // Vietnam
+  { zone: 'APAC', field: 'access', needles: [ 'Local Proxy' ] },                              // China
   { zone: 'EUR', field: 'group', needles: [
     'we.interbrew.net/ABI-IBS-EU-EuropeDC1 (Amsterdam)/Groups/User Groups/Applications/G-SWED-Netskope_Users',
     'rus.efesmoscow/GFolders/Netskope/G-SRUSG-NetskopeUsers_Exeptions-RUK',
@@ -284,8 +286,8 @@ for (const r of ZONE_RULES){
    an AD path whose first segment is the forest domain ("na.interbrew.net/
    Security Groups/…"), and the domain alone identifies the zone — which is
    what rescues the many users who sit in groups outside the policy lists.
-   ONE.OFC.LOC and AP1.OFC.LOC host several zones in one forest, so they
-   carry no zone of their own and are resolved by DOMAIN_SEGMENTS below. */
+   ONE.OFC.LOC hosts several zones in one forest, so it carries no zone of
+   its own and is resolved by DOMAIN_SEGMENTS below. */
 const ZONE_DOMAINS = [
   ['modelo.gmodelo.com.mx',        'MAZ'],
   ['abc.corp.anheuser-busch.com',  'NAZ'],
@@ -299,9 +301,9 @@ const ZONE_DOMAINS = [
   ['na.interbrew.net',             'NAZ'],
   ['co.interbrew.net',             'NAZ'],
   ['la.interbrew.net',             'NAZ'],
-  ['ob.co.kr',                     'APAC KR'],
-  ['india.asia.gcn.local',         'APAC IN'],
-  ['ap1.ofc.loc',                  'APAC'],     // per-country, see DOMAIN_SEGMENTS
+  ['ob.co.kr',                     'APAC'],
+  ['india.asia.gcn.local',         'APAC'],
+  ['ap1.ofc.loc',                  'APAC'],
   ['one.ofc.loc',                  null],       // multi-zone, see DOMAIN_SEGMENTS
   ['latam.americas.gcn.local',     'SAZ'],
   ['quinsacl.sgo.quilmes.cl',      'SAZ'],
@@ -330,12 +332,6 @@ const DOMAIN_SEGMENTS = {
     ['/zone-africa',          'AFR'],
     ['/zone-asia pacific',    'APAC'],
     ['/zone-apac',            'APAC'],
-  ],
-  'ap1.ofc.loc': [
-    ['/india',   'APAC IN'],
-    ['/vietnam', 'APAC VN'],
-    ['/korea',   'APAC KR'],
-    ['/china',   'APAC CN'],
   ],
 };
 
@@ -372,7 +368,7 @@ function zoneFromDomain(text){
 }
 
 /* Display / color order for the mapped zones (first 8 get palette slots). */
-const ZONE_ORDER = ['SAZ','NAZ','MAZ','GHQ','EUR','AFR','APAC IN','APAC VN','APAC KR','APAC CN','APAC'];
+const ZONE_ORDER = ['SAZ','NAZ','MAZ','GHQ','EUR','AFR','APAC'];
 
 /* Groups deliberately NOT mapped to any zone (e.g. Growth). Their text is
    removed before the token fallback so a zone code inside the group name
