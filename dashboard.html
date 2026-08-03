@@ -379,6 +379,20 @@ const ZONE_ORDER = ['SAZ','NAZ','MAZ','GHQ','EUR','AFR','APAC IN','APAC VN','APA
    (…-GHQ-…-Growth) cannot leak a wrong zone. */
 const ZONE_EXCLUDE = ['soneu-ghq-br-people-all-growth'];
 
+/* OU / group fragments whose rows are DROPPED at ingest — excluded from every
+   count, not filed under "Unknown". Dropped rows are still tallied and
+   reported in the load panel so the exclusion is never silent. */
+const DROP_SEGMENTS = ['/zone-latin america copec'];
+
+function dropReason(ou, group, zone){
+  const hay = (group + ' ' + ou).toLowerCase();
+  for (const s of DROP_SEGMENTS) if (hay.includes(s)) return 'excluded OU';
+  // Nothing to map on: no User Group, no Organization Unit, and no rule hit
+  // from another column. These would otherwise all pile up in "Unknown".
+  if (zone === 'Unknown' && !group.trim() && !ou.trim()) return 'no User Group / OU';
+  return null;
+}
+
 /* Fallback token detection for rows no rule matches. */
 const ZONE_TOKENS = ['SAZ','NAZ','MAZ','GHQ','EUR','APAC','AFR','AMER','EMEA','APJ','LATAM'];
 
@@ -411,6 +425,7 @@ const state = {
   cells: new Map(),      // "zone\u0000monthKey" -> {zone, monthKey, users:Set, gb, gbUp, gbDown, records, apps:Map, acts:Map}
   monthLabels: new Map(),// monthKey -> display label
   unmatched: new Map(),  // usergroup/OU value -> row count, for zone "Unknown" diagnostics
+  dropped: new Map(),    // drop reason -> row count, reported after loading
   rowsTotal: 0,
   source: 'none',
   files: 0,
@@ -424,6 +439,7 @@ const state = {
 
 function clearData(){
   state.cells = new Map(); state.monthLabels = new Map(); state.unmatched = new Map();
+  state.dropped = new Map();
   state.rowsTotal = 0; state.files = 0; state.source = 'none'; state.hasActivity = false;
 }
 
@@ -494,7 +510,7 @@ async function ingestFile(file, onBytes){
   const reader = file.stream().getReader();
   const dec = new TextDecoder('utf-8');
   let pre = '', delim = ',', idx = null;
-  let cur = '', row = [], inQ = false, skipLF = false, rows = 0;
+  let cur = '', row = [], inQ = false, skipLF = false, rows = 0, dropped = 0;
 
   const num = (s) => {
     s = delim === ';' ? s.replace(/\./g,'').replace(',', '.') : s.replace(/,/g,'');
@@ -508,13 +524,19 @@ async function ingestFile(file, onBytes){
     const up   = idx.up   !== undefined ? num(String(c[idx.up] ?? ''))/idx.div.up : 0;
     let total  = idx.total!== undefined ? num(String(c[idx.total] ?? ''))/idx.div.total : 0;
     if (!total) total = down + up;
-    const zone = deriveZone(idx.ou !== undefined ? c[idx.ou] : '',
-                            idx.group !== undefined ? c[idx.group] : '',
+    const ouVal    = idx.ou    !== undefined ? String(c[idx.ou]    ?? '') : '';
+    const groupVal = idx.group !== undefined ? String(c[idx.group] ?? '') : '';
+    const zone = deriveZone(ouVal, groupVal,
                             idx.access !== undefined ? c[idx.access] : '',
                             idx.user !== undefined ? c[idx.user] : '');
+    const drop = dropReason(ouVal, groupVal, zone);
+    if (drop){
+      state.dropped.set(drop, (state.dropped.get(drop)||0) + 1);
+      dropped++;
+      return;
+    }
     if (zone === 'Unknown'){
-      const src = String((idx.group !== undefined && c[idx.group]) ? c[idx.group]
-        : (idx.ou !== undefined && c[idx.ou]) ? c[idx.ou] : '(empty)').slice(0, 160);
+      const src = (groupVal || ouVal).slice(0, 160);
       if (state.unmatched.has(src) || state.unmatched.size < 500)
         state.unmatched.set(src, (state.unmatched.get(src)||0) + 1);
     }
@@ -581,9 +603,9 @@ async function ingestFile(file, onBytes){
     if (done) break;
   }
   if (cur !== '' || row.length){ row.push(cur); endRow(); }
-  if (!idx) return { rows: 0, unit: null, hasZoneCols: false };   // empty file
+  if (!idx) return { rows: 0, dropped: 0, unit: null, hasZoneCols: false };   // empty file
   const byteCol = ['total','down','up'].find(k => idx[k] !== undefined);
-  return { rows, unit: byteCol ? idx.units[byteCol] : null,
+  return { rows, dropped, unit: byteCol ? idx.units[byteCol] : null,
            hasZoneCols: idx.group !== undefined || idx.ou !== undefined };
 }
 
@@ -685,17 +707,25 @@ async function loadFiles(fileList){
         bar.value += bytes;
         lbl.textContent = `${base} — ${Math.min(100, Math.round(bar.value / bar.max * 100))}%`;
       });
-      if (!res.rows){ lines.push(['bad', f.name + ' — has headers but no data rows, skipped.']); continue; }
+      if (!res.rows){
+        lines.push(['bad', res.dropped
+          ? `${f.name} — all ${res.dropped.toLocaleString('en-US')} rows dropped (nothing to map a zone on), skipped.`
+          : f.name + ' — has headers but no data rows, skipped.']);
+        continue;
+      }
       ok++;
       const unitNote = res.unit ? ` Traffic columns read as ${res.unit} and shown as GB.`
                                 : ' No traffic column found — GB totals will be 0.';
-      lines.push(['ok', f.name + ' — loaded ' + res.rows.toLocaleString('en-US') + ' rows.' + unitNote]);
+      const dropNote = res.dropped ? ` ${res.dropped.toLocaleString('en-US')} rows dropped.` : '';
+      lines.push(['ok', f.name + ' — loaded ' + res.rows.toLocaleString('en-US') + ' rows.' + dropNote + unitNote]);
       if (!res.hasZoneCols)
-        lines.push(['bad', f.name + ' — no "User Group" or "Organization Unit" column, so every row lands in zone "Unknown". Re-run the export with usergroup / organization_unit included.']);
+        lines.push(['bad', f.name + ' — no "User Group" or "Organization Unit" column, so nothing can be zoned. Re-run the export with usergroup / organization_unit included.']);
     } catch (e) {
       lines.push(['bad', f.name + ' — skipped: ' + (e.error || 'could not read file (' + e.message + ')')]);
     }
   }
+  for (const [reason, cnt] of [...state.dropped.entries()].sort((a,b) => b[1]-a[1]))
+    lines.push(['bad', `${cnt.toLocaleString('en-US')} rows dropped — ${reason}. They are excluded from every figure below.`]);
   if (state.unmatched.size){
     const unknownRows = [...state.unmatched.values()].reduce((s,v) => s+v, 0);
     lines.push(['bad', `${unknownRows.toLocaleString('en-US')} rows mapped to zone "Unknown". Most common unmatched User Group / OU values:`]);
