@@ -284,8 +284,8 @@ for (const r of ZONE_RULES){
    an AD path whose first segment is the forest domain ("na.interbrew.net/
    Security Groups/…"), and the domain alone identifies the zone — which is
    what rescues the many users who sit in groups outside the policy lists.
-   ONE.OFC.LOC is deliberately absent: it spans GHQ, NAZ, SAZ, AFR and APAC,
-   so only the exact rules above may map it. */
+   ONE.OFC.LOC and AP1.OFC.LOC host several zones in one forest, so they
+   carry no zone of their own and are resolved by DOMAIN_SEGMENTS below. */
 const ZONE_DOMAINS = [
   ['modelo.gmodelo.com.mx',        'MAZ'],
   ['abc.corp.anheuser-busch.com',  'NAZ'],
@@ -301,7 +301,8 @@ const ZONE_DOMAINS = [
   ['la.interbrew.net',             'NAZ'],
   ['ob.co.kr',                     'APAC KR'],
   ['india.asia.gcn.local',         'APAC IN'],
-  ['ap1.ofc.loc',                  'APAC'],     // refined per country below
+  ['ap1.ofc.loc',                  'APAC'],     // per-country, see DOMAIN_SEGMENTS
+  ['one.ofc.loc',                  null],       // multi-zone, see DOMAIN_SEGMENTS
   ['latam.americas.gcn.local',     'SAZ'],
   ['quinsacl.sgo.quilmes.cl',      'SAZ'],
   ['quinsauy.mvd.bemberg.com.uy',  'SAZ'],
@@ -310,15 +311,38 @@ const ZONE_DOMAINS = [
   ['cervepar.local',               'SAZ'],
 ];
 
-/* AP1.OFC.LOC hosts several APAC countries in one forest — the OU segment
-   after the domain says which. Anything else stays plain "APAC". */
-const APAC_COUNTRIES = [['/india', 'APAC IN'], ['/vietnam', 'APAC VN'],
-                        ['/korea', 'APAC KR'], ['/china', 'APAC CN']];
+/* Domains holding more than one zone — the path segment after the domain
+   decides. ONE.OFC.LOC OUs read
+   "ONE.OFC.LOC/Zone-Latin America North/Managed Objects/Managed Users/…",
+   so the Zone-* segment is the zone. A domain whose segment matches nothing
+   falls through to the next mapping step rather than guessing, so any new
+   Zone-* value shows up in the "Unknown" diagnostics instead of silently
+   landing in the wrong bucket. */
+const DOMAIN_SEGMENTS = {
+  'one.ofc.loc': [
+    ['/zone-abi global',      'GHQ'],
+    ['/zone-global',          'GHQ'],
+    ['/zone-north america',   'NAZ'],
+    ['/zone-middle americas', 'MAZ'],
+    ['/zone-latin america north', 'SAZ'],   // incl. the BRAHMA OUs
+    ['/zone-latin america south', 'SAZ'],   // matches the SONEG_…_AllUsers_LAS rule
+    ['/zone-europe',          'EUR'],
+    ['/zone-africa',          'AFR'],
+    ['/zone-asia pacific',    'APAC'],
+    ['/zone-apac',            'APAC'],
+  ],
+  'ap1.ofc.loc': [
+    ['/india',   'APAC IN'],
+    ['/vietnam', 'APAC VN'],
+    ['/korea',   'APAC KR'],
+    ['/china',   'APAC CN'],
+  ],
+};
 
-function refineApac(zone, value){
-  if (zone !== 'APAC') return zone;
-  for (const [needle, z] of APAC_COUNTRIES) if (value.includes(needle)) return z;
-  return zone;
+function zoneForDomain(dom, fallback, value){
+  const segments = DOMAIN_SEGMENTS[dom];
+  if (segments) for (const [needle, z] of segments) if (value.includes(needle)) return z;
+  return fallback;   // null for multi-zone domains with no segment hit
 }
 
 /* Map by AD domain. `text` is an already-lowercased User Group / OU cell,
@@ -331,11 +355,19 @@ function zoneFromDomain(text){
     // "domain/path/group", "DOMAIN\user" and "user@domain" all appear.
     let d = v.split('/')[0].split('\\')[0].trim();
     if (d.includes('@')) d = d.split('@').pop().trim();
-    for (const [dom, z] of ZONE_DOMAINS) if (d === dom) return refineApac(z, v);
+    for (const [dom, z] of ZONE_DOMAINS){
+      if (d !== dom) continue;
+      const hit = zoneForDomain(dom, z, v);
+      if (hit) return hit;
+    }
   }
   // Fall back to the domain appearing anywhere in the cell (e.g. a value that
   // leads with a display name before the AD path).
-  for (const [dom, z] of ZONE_DOMAINS) if (text.includes(dom)) return refineApac(z, text);
+  for (const [dom, z] of ZONE_DOMAINS){
+    if (!text.includes(dom)) continue;
+    const hit = zoneForDomain(dom, z, text);
+    if (hit) return hit;
+  }
   return null;
 }
 
