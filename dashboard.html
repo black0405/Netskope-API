@@ -314,16 +314,18 @@ const ZONE_DOMAINS = [
 /* Domains holding more than one zone — the path segment after the domain
    decides. ONE.OFC.LOC OUs read
    "ONE.OFC.LOC/Zone-Latin America North/Managed Objects/Managed Users/…",
-   so the Zone-* segment is the zone. Latin America North and South both
-   map to SAZ. A domain whose segment matches nothing falls through to the
-   next mapping step rather than guessing. */
+   so the Zone-* segment is the zone. A domain whose segment matches nothing
+   falls through to the next mapping step rather than guessing, so any new
+   Zone-* value shows up in the "Unknown" diagnostics instead of silently
+   landing in the wrong bucket. */
 const DOMAIN_SEGMENTS = {
   'one.ofc.loc': [
     ['/zone-abi global',      'GHQ'],
     ['/zone-global',          'GHQ'],
     ['/zone-north america',   'NAZ'],
     ['/zone-middle americas', 'MAZ'],
-    ['/zone-latin america',   'SAZ'],   // North and South
+    ['/zone-latin america north', 'SAZ'],   // incl. the BRAHMA OUs
+    ['/zone-latin america south', 'MAZ'],
     ['/zone-europe',          'EUR'],
     ['/zone-africa',          'AFR'],
     ['/zone-asia pacific',    'APAC'],
