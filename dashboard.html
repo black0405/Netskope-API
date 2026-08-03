@@ -1,3 +1,4 @@
+<meta charset="utf-8">
 <title>Netskope GenAI Usage Dashboard</title>
 <style>
   /* == Tokens ============================================================= */
@@ -192,7 +193,7 @@
     <div class="card c4" id="cardActivities"></div>
   </div>
 
-  <footer id="stamp">Built for the Netskope GenAI export pipeline · byte columns are read as MB and shown here as GB.</footer>
+  <footer id="stamp">Built for the Netskope GenAI export pipeline · traffic columns are converted to GB, using the unit named in the column header (unlabelled = raw bytes).</footer>
 </div>
 
 <div id="tip" role="status"></div>
@@ -278,8 +279,68 @@ for (const r of ZONE_RULES){
   r.needles = [...set];
 }
 
+/* ---- AD domain -> zone ---------------------------------------------------
+   Second pass, used when no rule above matched. A row's User Group / OU is
+   an AD path whose first segment is the forest domain ("na.interbrew.net/
+   Security Groups/…"), and the domain alone identifies the zone — which is
+   what rescues the many users who sit in groups outside the policy lists.
+   ONE.OFC.LOC is deliberately absent: it spans GHQ, NAZ, SAZ, AFR and APAC,
+   so only the exact rules above may map it. */
+const ZONE_DOMAINS = [
+  ['modelo.gmodelo.com.mx',        'MAZ'],
+  ['abc.corp.anheuser-busch.com',  'NAZ'],
+  ['abpg.corp.anheuser-busch.com', 'NAZ'],
+  ['beerdivision.africa.gcn.local','AFR'],
+  ['sabmaa.africa.gcn.local',      'AFR'],
+  ['we.interbrew.net',             'EUR'],
+  ['ee.interbrew.net',             'EUR'],
+  ['ccc.europe.gcn.local',         'EUR'],
+  ['rus.efesmoscow',               'EUR'],
+  ['na.interbrew.net',             'NAZ'],
+  ['co.interbrew.net',             'NAZ'],
+  ['la.interbrew.net',             'NAZ'],
+  ['ob.co.kr',                     'APAC KR'],
+  ['india.asia.gcn.local',         'APAC IN'],
+  ['ap1.ofc.loc',                  'APAC'],     // refined per country below
+  ['latam.americas.gcn.local',     'SAZ'],
+  ['quinsacl.sgo.quilmes.cl',      'SAZ'],
+  ['quinsauy.mvd.bemberg.com.uy',  'SAZ'],
+  ['cbn.com.bo',                   'SAZ'],
+  ['cmqpnt.bue.bemberg.com.ar',    'SAZ'],
+  ['cervepar.local',               'SAZ'],
+];
+
+/* AP1.OFC.LOC hosts several APAC countries in one forest — the OU segment
+   after the domain says which. Anything else stays plain "APAC". */
+const APAC_COUNTRIES = [['/india', 'APAC IN'], ['/vietnam', 'APAC VN'],
+                        ['/korea', 'APAC KR'], ['/china', 'APAC CN']];
+
+function refineApac(zone, value){
+  if (zone !== 'APAC') return zone;
+  for (const [needle, z] of APAC_COUNTRIES) if (value.includes(needle)) return z;
+  return zone;
+}
+
+/* Map by AD domain. `text` is an already-lowercased User Group / OU cell,
+   which may hold several values joined by ; , or |. */
+function zoneFromDomain(text){
+  if (!text) return null;
+  for (const part of text.split(/[;,|]/)){
+    const v = part.trim();
+    if (!v) continue;
+    // "domain/path/group", "DOMAIN\user" and "user@domain" all appear.
+    let d = v.split('/')[0].split('\\')[0].trim();
+    if (d.includes('@')) d = d.split('@').pop().trim();
+    for (const [dom, z] of ZONE_DOMAINS) if (d === dom) return refineApac(z, v);
+  }
+  // Fall back to the domain appearing anywhere in the cell (e.g. a value that
+  // leads with a display name before the AD path).
+  for (const [dom, z] of ZONE_DOMAINS) if (text.includes(dom)) return refineApac(z, text);
+  return null;
+}
+
 /* Display / color order for the mapped zones (first 8 get palette slots). */
-const ZONE_ORDER = ['SAZ','NAZ','MAZ','GHQ','EUR','AFR','APAC IN','APAC VN','APAC KR','APAC CN'];
+const ZONE_ORDER = ['SAZ','NAZ','MAZ','GHQ','EUR','AFR','APAC IN','APAC VN','APAC KR','APAC CN','APAC'];
 
 /* Groups deliberately NOT mapped to any zone (e.g. Growth). Their text is
    removed before the token fallback so a zone code inside the group name
@@ -289,7 +350,26 @@ const ZONE_EXCLUDE = ['soneu-ghq-br-people-all-growth'];
 /* Fallback token detection for rows no rule matches. */
 const ZONE_TOKENS = ['SAZ','NAZ','MAZ','GHQ','EUR','APAC','AFR','AMER','EMEA','APJ','LATAM'];
 
-const MB_PER_GB = 1024;
+/* Byte columns arrive in different units depending on the export: the Python
+   scripts round to MB and say so in the header ("Sum - Total Bytes (MB)"),
+   while a raw activities/datasearch export carries plain byte counts
+   (numbytes, client_bytes, server_bytes). Everything is normalised to GB at
+   ingest using the divisor implied by the header text — unlabelled columns
+   are treated as bytes, which is what the API actually returns. */
+const UNIT_DIVISORS = [
+  [/\(\s*tb\s*\)|\btb\b|terabytes?/, 1/1024,       'TB'],
+  [/\(\s*gb\s*\)|\bgb\b|gigabytes?/, 1,            'GB'],
+  [/\(\s*mb\s*\)|\bmb\b|megabytes?/, 1024,         'MB'],
+  [/\(\s*kb\s*\)|\bkb\b|kilobytes?/, 1024*1024,    'KB'],
+];
+const BYTES_PER_GB = 1024*1024*1024;
+
+function unitOf(header){
+  const h = String(header||'').toLowerCase();
+  for (const [re, div, name] of UNIT_DIVISORS) if (re.test(h)) return { div, name };
+  return { div: BYTES_PER_GB, name: 'bytes' };
+}
+
 const $ = (s) => document.querySelector(s);
 
 /* Rows are never stored: every record folds into a (zone, month) aggregate
@@ -392,13 +472,14 @@ async function ingestFile(file, onBytes){
     if (row.length === 1 && row[0] === ''){ row = []; return; }
     const c = row; row = [];
     const [monthKey, monthLabel] = deriveMonth(idx.date !== undefined ? c[idx.date] : '');
-    const down = idx.down !== undefined ? num(String(c[idx.down] ?? ''))/MB_PER_GB : 0;
-    const up   = idx.up   !== undefined ? num(String(c[idx.up] ?? ''))/MB_PER_GB : 0;
-    let total  = idx.total!== undefined ? num(String(c[idx.total] ?? ''))/MB_PER_GB : 0;
+    const down = idx.down !== undefined ? num(String(c[idx.down] ?? ''))/idx.div.down : 0;
+    const up   = idx.up   !== undefined ? num(String(c[idx.up] ?? ''))/idx.div.up : 0;
+    let total  = idx.total!== undefined ? num(String(c[idx.total] ?? ''))/idx.div.total : 0;
     if (!total) total = down + up;
     const zone = deriveZone(idx.ou !== undefined ? c[idx.ou] : '',
                             idx.group !== undefined ? c[idx.group] : '',
-                            idx.access !== undefined ? c[idx.access] : '');
+                            idx.access !== undefined ? c[idx.access] : '',
+                            idx.user !== undefined ? c[idx.user] : '');
     if (zone === 'Unknown'){
       const src = String((idx.group !== undefined && c[idx.group]) ? c[idx.group]
         : (idx.ou !== undefined && c[idx.ou]) ? c[idx.ou] : '(empty)').slice(0, 160);
@@ -468,7 +549,10 @@ async function ingestFile(file, onBytes){
     if (done) break;
   }
   if (cur !== '' || row.length){ row.push(cur); endRow(); }
-  return rows;
+  if (!idx) return { rows: 0, unit: null, hasZoneCols: false };   // empty file
+  const byteCol = ['total','down','up'].find(k => idx[k] !== undefined);
+  return { rows, unit: byteCol ? idx.units[byteCol] : null,
+           hasZoneCols: idx.group !== undefined || idx.ou !== undefined };
 }
 
 const HEADER_MAP = {
@@ -493,17 +577,30 @@ function mapHeaders(headerRow){
   for (const [key, aliases] of Object.entries(HEADER_MAP)){
     for (const a of aliases){ const i = norm.indexOf(a); if (i !== -1){ idx[key] = i; break; } }
   }
+  // Per-column "value -> GB" divisor, read off the header text.
+  idx.div = {}; idx.units = {};
+  for (const key of ['total','down','up']){
+    const u = unitOf(idx[key] !== undefined ? norm[idx[key]] : '');
+    idx.div[key] = u.div; idx.units[key] = u.name;
+  }
   return idx;
 }
 
-function deriveZone(ou, group, access){
+function deriveZone(ou, group, access, user){
   const fields = { ou: (ou||'').toLowerCase(), group: (group||'').toLowerCase(),
                    access: (access||'').toLowerCase() };
+  // 1. exact policy rules
   for (const r of ZONE_RULES){
     const hay = fields[r.field];
     if (!hay) continue;
     for (const n of r.needles) if (hay.includes(n)) return r.zone;
   }
+  // 2. AD domain of the group / OU — and, last, of the user's own UPN
+  for (const hay of [fields.group, fields.ou, (user||'').toLowerCase()]){
+    const z = zoneFromDomain(hay);
+    if (z) return z;
+  }
+  // 3. loose zone token left in the group / OU text
   let hay2 = (fields.ou + ' ' + fields.group);
   for (const x of ZONE_EXCLUDE) hay2 = hay2.split(x).join(' ');
   hay2 = hay2.toUpperCase();
@@ -552,13 +649,17 @@ async function loadFiles(fileList){
     lbl.textContent = base + '…';
     await new Promise(r => setTimeout(r));
     try {
-      const n = await ingestFile(f, (bytes) => {
+      const res = await ingestFile(f, (bytes) => {
         bar.value += bytes;
         lbl.textContent = `${base} — ${Math.min(100, Math.round(bar.value / bar.max * 100))}%`;
       });
-      if (!n){ lines.push(['bad', f.name + ' — has headers but no data rows, skipped.']); continue; }
+      if (!res.rows){ lines.push(['bad', f.name + ' — has headers but no data rows, skipped.']); continue; }
       ok++;
-      lines.push(['ok', f.name + ' — loaded ' + n.toLocaleString('en-US') + ' rows.']);
+      const unitNote = res.unit ? ` Traffic columns read as ${res.unit} and shown as GB.`
+                                : ' No traffic column found — GB totals will be 0.';
+      lines.push(['ok', f.name + ' — loaded ' + res.rows.toLocaleString('en-US') + ' rows.' + unitNote]);
+      if (!res.hasZoneCols)
+        lines.push(['bad', f.name + ' — no "User Group" or "Organization Unit" column, so every row lands in zone "Unknown". Re-run the export with usergroup / organization_unit included.']);
     } catch (e) {
       lines.push(['bad', f.name + ' — skipped: ' + (e.error || 'could not read file (' + e.message + ')')]);
     }
