@@ -849,7 +849,11 @@ def fields_param() -> Optional[str]:
     if not SEND_FIELDS_PARAM or not DESIRED_COLUMNS:
         return None
 
-    wanted: List[str] = []
+    # Always ask for _id: it is the per-event unique key the dedupe in
+    # fetch_all relies on. Without it, distinct events whose exported
+    # columns happen to match (same user/url/second/bytes) collapse into
+    # one row.
+    wanted: List[str] = ["_id"]
     for column in DESIRED_COLUMNS:
         if column in PLACEHOLDER_COLUMNS:
             continue
