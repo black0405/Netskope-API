@@ -539,7 +539,7 @@ INT_FIELDS: set = {"numbytes", "server_bytes", "client_bytes"}
 # decide whether real traffic happened.
 #
 # Set to [] to keep every row including the all-zero ones.
-DROP_IF_ALL_ZERO: List[str] = ["client_bytes", "server_bytes"]
+DROP_IF_ALL_ZERO: List[str] = []
 
 # Prepend a leftmost column holding a row counter, so the first data row
 # (spreadsheet row 2, since row 1 is the header) is numbered
