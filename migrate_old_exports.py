@@ -31,6 +31,10 @@ from pathlib import Path
 
 DEFAULT_YEAR = 2026
 
+# Some old files hold huge fields (long URLs / embedded blobs); the default
+# 128KB csv limit chokes on them. 1e9 stays within Windows' 32-bit C long.
+csv.field_size_limit(1_000_000_000)
+
 # Same worksheet name export_genai_applications.py uses for .xlsx output.
 EXCEL_SHEET_NAME = "in"
 
