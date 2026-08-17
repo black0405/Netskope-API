@@ -12,10 +12,13 @@ Handles filenames like:
     GENAI_apps_activity_2026-03-05T0601.csv
 
 Each becomes GenerativeAI_Applications_YYYY-MM-DD.csv (first day of a range;
-year defaults to 2026 when the name has none), and the header row is fixed:
-    blank first column      -> S.No.  (values renumbered 1..n)
+year defaults to 2026 when the name has none), and the columns are reshaped
+to the export layout:
+    blank first column      -> S.No.  (values renumbered 1..n; added if absent)
     Event Data              -> Event Date
     Sum - File Size(MB)     -> Sum - File Size (MB)
+    extra columns (e.g. department) are dropped
+A file is skipped only if one of the export columns is missing entirely.
 
 .xlsx files are handled too (first worksheet); their sheet is renamed to
 EXCEL_SHEET_NAME to match the export script's output.
@@ -102,8 +105,10 @@ def migrate(folder: Path, dry_run: bool) -> None:
             print(f"SKIP {path.name}: {exc}")
             continue
         rows = read_rows(path)
-        if not rows or fix_header([str(h) for h in rows[0]]) != TARGET_HEADERS:
-            print(f"SKIP {path.name}: columns don't match expected format")
+        fixed = fix_header([str(h) for h in rows[0]]) if rows else []
+        missing = [h for h in TARGET_HEADERS[1:] if h not in fixed]
+        if missing:
+            print(f"SKIP {path.name}: missing columns {missing}")
             continue
         ext = path.suffix.lower()
         dest = folder / f"GenerativeAI_Applications_{label}{ext}"
@@ -114,11 +119,14 @@ def migrate(folder: Path, dry_run: bool) -> None:
         print(f"{path.name}  ->  {dest.name}")
         if dry_run:
             continue
-        rows[0] = fix_header([str(h) for h in rows[0]])
-        for i, row in enumerate(rows[1:], 1):
-            if row:
-                row[0] = i
-        write_rows(dest, rows)
+        # Reshape every row to the export layout: fresh S.No. counter, then
+        # the nine data columns in order; anything else (department...) drops.
+        idx = [fixed.index(h) for h in TARGET_HEADERS[1:]]
+        out = [TARGET_HEADERS] + [
+            [i] + [row[j] if j < len(row) else "" for j in idx]
+            for i, row in enumerate(rows[1:], 1) if row
+        ]
+        write_rows(dest, out)
         path.unlink()
 
 
