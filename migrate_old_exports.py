@@ -75,8 +75,14 @@ def read_rows(path: Path) -> list:
         ws = load_workbook(path).worksheets[0]
         return [["" if c is None else c for c in row]
                 for row in ws.iter_rows(values_only=True)]
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        return list(csv.reader(f))
+    # Old files come from mixed sources: try UTF-8 first, fall back to
+    # cp1252 (Excel "ANSI" saves), which accepts any byte sequence.
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            with open(path, newline="", encoding=enc) as f:
+                return list(csv.reader(f))
+        except UnicodeDecodeError:
+            continue
 
 
 def write_rows(path: Path, rows: list) -> None:
