@@ -16,6 +16,9 @@ year defaults to 2026 when the name has none), and the header row is fixed:
     blank first column      -> S.No.  (values renumbered 1..n)
     Event Data              -> Event Date
     Sum - File Size(MB)     -> Sum - File Size (MB)
+
+.xlsx files are handled too (first worksheet); their sheet is renamed to
+EXCEL_SHEET_NAME to match the export script's output.
 """
 
 import csv
@@ -24,6 +27,9 @@ import sys
 from pathlib import Path
 
 DEFAULT_YEAR = 2026
+
+# Same worksheet name export_genai_applications.py uses for .xlsx output.
+EXCEL_SHEET_NAME = "in"
 
 TARGET_HEADERS = ["S.No.", "User", "Application", "URL", "Activity",
                   "Object Type", "Object Name", "Event Date",
@@ -60,11 +66,34 @@ def fix_header(old: list) -> list:
     return out
 
 
+def read_rows(path: Path) -> list:
+    if path.suffix.lower() == ".xlsx":
+        from openpyxl import load_workbook
+        ws = load_workbook(path).worksheets[0]
+        return [["" if c is None else c for c in row]
+                for row in ws.iter_rows(values_only=True)]
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        return list(csv.reader(f))
+
+
+def write_rows(path: Path, rows: list) -> None:
+    if path.suffix.lower() == ".xlsx":
+        from openpyxl import Workbook
+        wb = Workbook()
+        wb.active.title = EXCEL_SHEET_NAME
+        for row in rows:
+            wb.active.append(row)
+        wb.save(path)
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(rows)
+
+
 def migrate(folder: Path, dry_run: bool) -> None:
-    old_files = [p for p in folder.glob("*.csv")
+    old_files = [p for ext in ("*.csv", "*.xlsx") for p in folder.glob(ext)
                  if re.match(r"GENAI[ _]apps[ _]activity", p.name, re.I)]
     if not old_files:
-        print(f"No 'GENAI apps activity' CSVs found in {folder}")
+        print(f"No 'GENAI apps activity' files found in {folder}")
         return
     for path in sorted(old_files):
         try:
@@ -72,25 +101,24 @@ def migrate(folder: Path, dry_run: bool) -> None:
         except ValueError as exc:
             print(f"SKIP {path.name}: {exc}")
             continue
-        with open(path, newline="", encoding="utf-8-sig") as f:
-            rows = list(csv.reader(f))
-        if not rows or fix_header(rows[0]) != TARGET_HEADERS:
+        rows = read_rows(path)
+        if not rows or fix_header([str(h) for h in rows[0]]) != TARGET_HEADERS:
             print(f"SKIP {path.name}: columns don't match expected format")
             continue
-        dest = folder / f"GenerativeAI_Applications_{label}.csv"
+        ext = path.suffix.lower()
+        dest = folder / f"GenerativeAI_Applications_{label}{ext}"
         n = 2
         while dest.exists():                     # never clobber
-            dest = folder / f"GenerativeAI_Applications_{label}_{n}.csv"
+            dest = folder / f"GenerativeAI_Applications_{label}_{n}{ext}"
             n += 1
         print(f"{path.name}  ->  {dest.name}")
         if dry_run:
             continue
-        rows[0] = fix_header(rows[0])
+        rows[0] = fix_header([str(h) for h in rows[0]])
         for i, row in enumerate(rows[1:], 1):
             if row:
-                row[0] = str(i)
-        with open(dest, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerows(rows)
+                row[0] = i
+        write_rows(dest, rows)
         path.unlink()
 
 
