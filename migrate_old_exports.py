@@ -72,6 +72,11 @@ def migrate(folder: Path, dry_run: bool) -> None:
         except ValueError as exc:
             print(f"SKIP {path.name}: {exc}")
             continue
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        if not rows or fix_header(rows[0]) != TARGET_HEADERS:
+            print(f"SKIP {path.name}: columns don't match expected format")
+            continue
         dest = folder / f"GenerativeAI_Applications_{label}.csv"
         n = 2
         while dest.exists():                     # never clobber
@@ -80,14 +85,10 @@ def migrate(folder: Path, dry_run: bool) -> None:
         print(f"{path.name}  ->  {dest.name}")
         if dry_run:
             continue
-        with open(path, newline="", encoding="utf-8-sig") as f:
-            rows = list(csv.reader(f))
-        if rows:
-            rows[0] = fix_header(rows[0])
-            renumber = rows[0][0] == "S.No."
-            for i, row in enumerate(rows[1:], 1):
-                if renumber and row:
-                    row[0] = str(i)
+        rows[0] = fix_header(rows[0])
+        for i, row in enumerate(rows[1:], 1):
+            if row:
+                row[0] = str(i)
         with open(dest, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerows(rows)
         path.unlink()
