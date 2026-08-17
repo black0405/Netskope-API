@@ -495,7 +495,7 @@ DEDUPE_ON: List[str] = []
 # day-space-padded form above via time.ctime(). Writing it as a pattern
 # would need %e for the space-padded day, and %e does not exist on Windows
 # -- so the sentinel is the portable way to get this exact layout.
-DATE_FORMAT: str = "ctime"
+DATE_FORMAT: str = "%m/%d/%Y"
 
 # Fields holding epoch seconds that should be formatted with DATE_FORMAT.
 EPOCH_FIELDS: set = {"timestamp", "_insertion_epoch_timestamp",
