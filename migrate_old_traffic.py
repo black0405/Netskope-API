@@ -28,6 +28,7 @@ CSV -- the format has no sheet name.
 import csv
 import re
 import sys
+import time
 from pathlib import Path
 
 DEFAULT_YEAR = 2026
@@ -62,6 +63,21 @@ def parse_date(name: str) -> str:
             year = int(m.group(3)) if m.group(3) else DEFAULT_YEAR
             return f"{year}-{month:02d}-{int(m.group(1)):02d}"
     raise ValueError(f"no date found in {name!r}")
+
+
+def short_date(value):
+    """Turn ctime-style Event Date values ("Thu Jul 30 21:00:20 2026") into
+    the export's short form (07/30/2026). Anything unrecognised passes
+    through unchanged."""
+    if hasattr(value, "strftime"):          # xlsx datetime cell
+        return value.strftime("%m/%d/%Y")
+    s = str(value).strip()
+    for fmt in ("%a %b %d %H:%M:%S %Y", "%a %b %d %Y"):
+        try:
+            return time.strftime("%m/%d/%Y", time.strptime(s, fmt))
+        except ValueError:
+            pass
+    return value
 
 
 def fix_header(old: list) -> list:
@@ -128,12 +144,17 @@ def migrate(folder: Path, dry_run: bool) -> None:
         if dry_run:
             continue
         # Reshape every row to the export layout: the eight columns in
-        # order; anything else (User Group, Department...) drops.
+        # order; anything else (User Group, Department...) drops. Event Date
+        # values are converted to the short date format on the way.
         idx = [fixed.index(h) for h in TARGET_HEADERS]
-        out = [TARGET_HEADERS] + [
-            [row[j] if j < len(row) else "" for j in idx]
-            for row in rows[1:] if row
-        ]
+        date_col = TARGET_HEADERS.index("Event Date")
+        out = [TARGET_HEADERS]
+        for row in rows[1:]:
+            if not row:
+                continue
+            vals = [row[j] if j < len(row) else "" for j in idx]
+            vals[date_col] = short_date(vals[date_col])
+            out.append(vals)
         write_rows(dest, out)
         path.unlink()
 
@@ -145,6 +166,9 @@ def selftest() -> None:
     assert parse_date("GenAI Analysis 29may") == "2026-05-29"
     assert fix_header(["Application", "Event Data", "Bytes Upload"]) == \
         ["Application", "Event Date", "Bytes Upload"]
+    assert short_date("Thu Jul 30 21:00:20 2026") == "07/30/2026"
+    assert short_date("Thu Jul  9 05:01:00 2026") == "07/09/2026"
+    assert short_date("07/30/2026") == "07/30/2026"
     print("selftest OK")
 
 
